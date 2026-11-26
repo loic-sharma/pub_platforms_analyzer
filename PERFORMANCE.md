@@ -68,7 +68,10 @@ So:
    - 16: 2503/43 (one run only)
 
    Fewer streams means less queuing on the link, so metadata stays fast too.
-   The best value depends on bandwidth. On a faster link, try a higher value.
+   The best value depends on bandwidth, and 4 was only measured on this one
+   home connection. **On a faster link (or a cloud machine), raise
+   `--archive-concurrency` and watch archive MB per second across a few
+   60-second runs; keep the lowest value past which it stops rising.**
 3. **An `inFlight` pool (max(1000, …))** caps the number of packages between
    "metadata started" and "line written". Without it, metadata runs far ahead
    of archives and finished records pile up in memory, especially with `--all`.
@@ -85,9 +88,15 @@ So:
    it read the whole file into memory and fully decoded every line, which
    hurts with multi-GB `--all` output.
 
-Trade-off: stopping the crawler now loses more work, up to about 1000 packages
-that are partly done. A restart fetches them again. Nothing partial is ever
-written.
+7. **Clean shutdown on Ctrl+C / SIGTERM.** The `inFlight` buffer means up to
+   ~1000 packages can be partly done at any moment, and killing the process
+   threw that work away. Now the first signal sets `_stopping`: packages still
+   waiting for a pool slot are dropped (via `_Stopped`, which is not recorded
+   as a failure), retries stop instead of sleeping through backoff, and only
+   requests already sent are finished and written. Measured: exit 9–11 s after
+   the signal (the wait is the 4 archive downloads in progress), no partial or
+   duplicate lines. A second signal calls `exit(130)` at once; the next run
+   truncates any partial line.
 
 ## How to benchmark
 
@@ -142,7 +151,13 @@ measure of real progress, because archives dominate the total work.
 Pitfalls found the hard way:
 - macOS has no `timeout` or `gtimeout`.
 - **Background jobs in a non-interactive bash ignore SIGINT**, so `kill -INT`
-  does nothing. Use `kill -TERM`.
+  does nothing to the original binary. Use `kill -TERM`. (The current version
+  watches SIGINT itself, which overrides the ignore.)
+- **SIGTERM now stops gracefully**, so the harness's `wait` includes ~10 s of
+  finishing in-flight downloads, and those records count. Against an older
+  binary that dies instantly on SIGTERM this slightly favours the new one;
+  for a strict comparison, count only lines written before the signal, or
+  compare runs of the current binary with different flags.
 - `/usr/bin/time -l` wrapping the binary makes `pgrep -n` return the wrong
   process. Use `$!` instead.
 - **Results are noisy.** pub.dev sits behind a CDN with `max-age=7200`, so the
@@ -180,33 +195,51 @@ Also check resume. Copy `pub.jsonl`, append a partial line such as
 the right "already done" count, the partial line is gone, and no id appears
 twice.
 
+And check shutdown: send one SIGINT or SIGTERM after ~20 s and confirm exit
+code 0 within seconds, a "Stopped after" line, no partial last line, and no
+new failures. Send two signals a second apart and confirm exit code 130
+almost immediately.
+
 ## Ideas not yet tried
 
 Roughly in order of expected value:
 
-1. **Tune or adapt archive concurrency.** 4 was best of {4, 8, 16} on this
-   link. 2, 3, 5 and 6 were not tried. An adaptive scheme, such as AIMD on
-   measured throughput, would carry over to other networks.
-2. **Graceful shutdown on SIGINT/SIGTERM.** Stop starting new work, finish what
-   is in flight, and flush. That would remove the "up to 1000 lost" cost of the
-   in-flight buffer. Alternatively, lower the `inFlight` cap.
-3. **Stream archives instead of buffering them.** Feed chunks into a chunked
+For context: on this connection a full crawl is roughly 40 minutes, and the
+link's ceiling (~4 MB/s) puts the best case near 20. That estimate is
+extrapolated from the first ~1300 packages. No code change can beat the link,
+so none of the ideas below were judged worth doing here. Running from a cloud
+machine near Google Cloud Storage is the biggest lever, and only then do 2 and
+3 start to matter.
+
+1. **Fine-tune archive concurrency.** 4 was best of {4, 8, 16} on this link;
+   2, 3, 5 and 6 were not tried. The owner chose to keep 4. Tuning per link is
+   a flag change; see the bold note in "What changed".
+2. **Stream archives instead of buffering them.** Feed chunks into a chunked
    sha256 sink and gzip→`TarReader` as they arrive. This overlaps CPU with
    network and caps memory per download, since archives can reach 100 MB.
    Watch out: the tar reader can stop before EOF, but sha256 has to see every
    byte, so keep draining the HTTP stream after tar finishes. A retry must
    throw away the partial entries. The CPU saving is small; the main benefit is
    memory.
-4. **Move archive parsing to an isolate** (`Isolate.run`) when using `--all`.
+3. **Move archive parsing to an isolate** (`Isolate.run`) when using `--all`.
    CPU is about 20 ms/MB, which only matters if bandwidth goes far above
    ~4 MB/s.
-5. **HTTP/2** (via `package:http2` or `cupertino_http`/`cronet_http`). `dart:io`
+4. **HTTP/2** (via `package:http2` or `cupertino_http`/`cronet_http`). `dart:io`
    `HttpClient` only speaks HTTP/1.1. Multiplexing would mainly help metadata
    latency. Archives stay bandwidth-bound.
-6. **Avoid fetching unneeded bytes.** `/api/packages/<name>` returns every
+5. **Avoid fetching unneeded bytes.** `/api/packages/<name>` returns every
    version's pubspec, but we only use `latest` and the version count. No
    lighter endpoint was found. The responses are already gzipped and small, so
    this is low value.
 
 What will **not** help: more metadata concurrency (flat past 32), or
 optimizing sha256, gzip or tar code paths (negligible next to the network).
+
+**Considered and rejected: adjusting archive concurrency automatically**
+(e.g. AIMD on measured throughput, ~80–120 lines). The throughput signal is
+dominated by which archives happen to be downloading (sizes range from KBs to
+9 MB+) and by CDN cache hits, so it needs long windows and gets only a handful
+of adjustments in a 40-minute crawl. Maximizing archive bytes can also slow
+the metadata requests sharing the link, which is why 4 beat 8. It can't be
+validated without real networks of different speeds. A fixed default plus
+the flag is more predictable.

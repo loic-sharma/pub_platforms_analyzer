@@ -14,6 +14,10 @@
 /// a few big archives can saturate the link without starving metadata.
 ///
 /// Safe to stop and restart: packages already in the output file are skipped.
+/// Ctrl+C (or SIGTERM) stops cleanly: no new requests start, downloads already
+/// running finish and are written, then the process exits. A second Ctrl+C
+/// quits immediately; at worst a partial last line is left, which the next run
+/// truncates.
 ///
 /// Query with DuckDB, e.g. top-level folders vs. declared platforms:
 ///   SELECT id,
@@ -50,6 +54,39 @@ late final http.Client _archiveClient;
 
 /// Fused decoder parses JSON straight from UTF-8 bytes, skipping the String.
 final _jsonUtf8 = utf8.decoder.fuse(json.decoder);
+
+/// Set by the first Ctrl+C / SIGTERM. Work that hasn't sent its request yet
+/// checks this and bails out with [_Stopped].
+var _stopping = false;
+
+/// Thrown instead of starting a request once [_stopping] is set. Not a failure:
+/// the package is simply left for the next run.
+class _Stopped implements Exception {
+  const _Stopped();
+}
+
+void _throwIfStopping() {
+  if (_stopping) throw const _Stopped();
+}
+
+/// First signal: stop starting new work. Second signal: exit now.
+List<StreamSubscription<ProcessSignal>> _watchStopSignals() {
+  void onSignal(ProcessSignal signal) {
+    if (_stopping) {
+      stderr.writeln('Second $signal: quitting immediately.');
+      exit(130);
+    }
+    _stopping = true;
+    stderr.writeln('$signal: finishing requests already in progress, then '
+        'exiting. Press Ctrl+C again to quit immediately.');
+  }
+
+  return [
+    ProcessSignal.sigint.watch().listen(onSignal),
+    // SIGTERM can't be watched on Windows.
+    if (!Platform.isWindows) ProcessSignal.sigterm.watch().listen(onSignal),
+  ];
+}
 
 Future<void> main(List<String> args) async {
   final parser = ArgParser()
@@ -92,13 +129,17 @@ Future<void> main(List<String> args) async {
   final inFlight = Pool(max(1000, concurrency + archiveConcurrency));
   final sw = Stopwatch()..start();
   var completed = 0;
+  final signalSubs = _watchStopSignals();
 
   await Future.wait(todo.map((name) => inFlight.withResource(() async {
+        if (_stopping) return;
         try {
           final record =
               await _processPackage(name, listAll, metaPool, archivePool);
           // Single isolate: each writeln lands as one whole line.
           out.writeln(jsonEncode(record));
+        } on _Stopped {
+          return;
         } catch (e) {
           failures.writeln(jsonEncode({'id': name, 'error': '$e'}));
         }
@@ -113,16 +154,30 @@ Future<void> main(List<String> args) async {
   await failures.close();
   _metaClient.close();
   _archiveClient.close();
-  stdout.writeln('Done in ${sw.elapsed}.');
+  // Signal watchers keep the process alive until cancelled.
+  for (final sub in signalSubs) {
+    await sub.cancel();
+  }
+  if (_stopping) {
+    stdout.writeln('Stopped after ${sw.elapsed}: $completed of '
+        '${todo.length} done this run. Run again to resume.');
+  } else {
+    stdout.writeln('Done in ${sw.elapsed}.');
+  }
 }
 
 Future<Map<String, Object?>> _processPackage(
     String name, bool listAll, Pool metaPool, Pool archivePool) async {
-  final meta = _jsonUtf8.convert(await metaPool.withResource(() => _get(
-        _metaClient,
-        Uri.https('pub.dev', '/api/packages/$name'),
-        headers: {'accept': 'application/vnd.pub.v2+json'},
-      ))) as Map<String, dynamic>;
+  // Each pool callback checks for a stop request first, so packages still
+  // queued for a slot are dropped instead of starting new downloads.
+  final meta = _jsonUtf8.convert(await metaPool.withResource(() {
+    _throwIfStopping();
+    return _get(
+      _metaClient,
+      Uri.https('pub.dev', '/api/packages/$name'),
+      headers: {'accept': 'application/vnd.pub.v2+json'},
+    );
+  })) as Map<String, dynamic>;
 
   final latest = meta['latest'] as Map<String, dynamic>;
   final pubspec = latest['pubspec'] as Map<String, dynamic>;
@@ -144,8 +199,10 @@ Future<Map<String, Object?>> _processPackage(
   if (isPlugin || listAll) {
     // The metadata slot is already released, so this wait doesn't block
     // other packages' metadata.
-    final bytes = await archivePool.withResource(
-        () => _get(_archiveClient, Uri.parse(latest['archive_url'] as String)));
+    final bytes = await archivePool.withResource(() {
+      _throwIfStopping();
+      return _get(_archiveClient, Uri.parse(latest['archive_url'] as String));
+    });
     record.addAll(await _listArchive(
       bytes,
       latest['archive_url'] as String,
@@ -226,6 +283,8 @@ Future<Uint8List> _get(http.Client client, Uri url,
     } on http.ClientException {
       if (attempt == maxAttempts) rethrow;
     }
+    // Don't sleep and retry while shutting down; leave it for the next run.
+    _throwIfStopping();
     final delayMs = 500 * pow(2, attempt) + _random.nextInt(500);
     await Future<void>.delayed(Duration(milliseconds: delayMs.toInt()));
   }
