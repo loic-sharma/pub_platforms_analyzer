@@ -1,6 +1,7 @@
 /// Crawls pub.dev and writes ONE JSON line per package to a single JSONL file.
 ///
-/// For every package: fetch metadata (pubspec of every version comes for free).
+/// For every package: fetch metadata (pubspec of every version comes for free)
+/// and its score (pub points, likes, downloads, tags; null if pub.dev has none).
 /// For plugins (or every package with --all): download the latest archive,
 /// verify its sha256, and list its tar entries in memory. Nothing is extracted
 /// and no per-package files are written.
@@ -190,6 +191,7 @@ Future<Map<String, Object?>> _processPackage(
   );
 
   final meta = _jsonUtf8.convert(metaResponse) as Map<String, dynamic>;
+  final score = await _score(metaLane, name);
   final latest = meta['latest'] as Map<String, dynamic>;
   final pubspec = latest['pubspec'] as Map<String, dynamic>;
   final flutter = pubspec['flutter'];
@@ -202,6 +204,9 @@ Future<Map<String, Object?>> _processPackage(
     'is_plugin': isPlugin,
     'is_discontinued': meta['isDiscontinued'] ?? false,
     'version_count': (meta['versions'] as List).length,
+    // Only in records written since scores were added; older lines lack the
+    // key (DuckDB reads it as NULL either way).
+    'score': score,
     'pubspec': pubspec,
     'entries': null,
     'pubspec_yaml': null,
@@ -217,6 +222,22 @@ Future<Map<String, Object?>> _processPackage(
     record.addAll(archiveRecord);
   }
   return record;
+}
+
+/// The package's pub points, likes, 30-day downloads and tags, or null if
+/// pub.dev has no score for it (404).
+Future<Map<String, dynamic>?> _score(_Lane lane, String name) async {
+  try {
+    final body = await _get(
+      lane,
+      Uri.https('pub.dev', '/api/packages/$name/score'),
+      headers: {'accept': 'application/vnd.pub.v2+json'},
+    );
+    return _jsonUtf8.convert(body) as Map<String, dynamic>;
+  } on _HttpStatusException catch (e) {
+    if (e.statusCode == 404) return null;
+    rethrow;
+  }
 }
 
 /// Checks the downloaded archive's hash, then streams through gzip + tar
@@ -303,11 +324,11 @@ Future<Uint8List> _get(
         await body.drain<void>();
         final transient = res.statusCode == 429 || res.statusCode >= 500;
         if (!transient || attempt == maxAttempts) {
-          throw StateError('HTTP ${res.statusCode} for $url');
+          throw _HttpStatusException(res.statusCode, url);
         }
       } catch (e) {
         // Retry socket, HTTP and TLS errors (e.g. a dropped handshake) and
-        // timeouts; anything else, including the StateError above, fails.
+        // timeouts; anything else, including the status error above, fails.
         final retriable = e is IOException ||
             e is http.ClientException ||
             e is TimeoutException;
@@ -317,6 +338,17 @@ Future<Uint8List> _get(
       await _backoff(Duration(milliseconds: backoffMs));
     }
   });
+}
+
+/// A non-200 response that wasn't retried (or ran out of retries).
+class _HttpStatusException implements Exception {
+  _HttpStatusException(this.statusCode, this.url);
+
+  final int statusCode;
+  final Uri url;
+
+  @override
+  String toString() => 'HTTP $statusCode for $url';
 }
 
 /// Sleeps for [duration], or less if a stop is requested meanwhile. The timer

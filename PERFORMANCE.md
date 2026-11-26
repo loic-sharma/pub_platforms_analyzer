@@ -109,6 +109,39 @@ So:
    Measured: exit 9–11 s after the signal (the wait is the 4 archive downloads
    in progress), no partial or duplicate lines. A second signal exits at once
    with 130 (SIGINT) or 143 (SIGTERM); the next run truncates any partial line.
+8. **Scores (`/api/packages/<name>/score`)** are fetched right after metadata,
+   in the metadata pool, and stored as `score` (null on 404). That is a second
+   ~150–270 byte request per package, so the metadata ceiling roughly halves:
+   pub.dev served ~160 requests/s here (no gain past 32 concurrent), i.e. ~80
+   packages/s, or ~20 minutes of metadata for all ~97k packages. Fetching it
+   in parallel with metadata would not help, because both requests use
+   metadata slots either way. Overall the crawl stays archive-bound: in the
+   plugin-heavy stretch, a resumed 60 s run wrote 388 packages (6.4/s) with
+   scores vs ~4.5/s in an earlier 99 s run without them, i.e. no slowdown
+   (the difference is run-to-run noise). Records written before scores were added have no
+   `score` key; existing lines are never rewritten.
+
+## Later measurement: a faster link (Nov 26, afternoon)
+
+Resuming at ~33.5k packages (mid-alphabet, many `flutter_*` plugins with
+4.6 MB average archives), the link delivered ~10 MB/s. Measured with the
+interface's received-byte counter (`netstat -ibn -I en0`) over 50 s, because
+counting only completed downloads undercounts high concurrency (many large
+downloads are still running when the window closes):
+
+| `--archive-concurrency` | MB/s received |
+|---|---|
+| 4 | 10.1, 10.2 |
+| 8 | 10.1 |
+| 16 | 9.8 |
+| 32 | 9.3 |
+
+So 4 saturates this link too; the ~2 packages/s seen there is simply ~10 MB/s
+divided by large archives. Archive bytes are very concentrated: of 6,221
+archives so far, 4% (over 20 MB) hold 60% of the bytes and 11% (over 5 MB)
+hold 88%. A flag to defer archives over a size limit (read from the response's
+Content-Length, abort without downloading, leave the package for a later run)
+would get most plugins much sooner without changing the total time.
 
 ## How to benchmark
 
