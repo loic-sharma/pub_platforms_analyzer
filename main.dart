@@ -49,10 +49,18 @@ const _userAgent = 'pub_insights/1.0 (+mailto:sharma.loic@gmail.com)';
 /// whole request, this never aborts a large archive that is still downloading.
 const _idleTimeout = Duration(seconds: 60);
 
-/// Separate clients so archive downloads never hold the connections that
-/// metadata requests need. Connections are kept alive and reused.
-late final http.Client _metaClient;
-late final http.Client _archiveClient;
+/// A pool of request slots with its own keep-alive HttpClient holding as many
+/// connections, so archive downloads never hold the connections that metadata
+/// requests need.
+typedef _Lane = ({Pool pool, http.Client client});
+
+_Lane _lane(int slots) => (
+      pool: Pool(slots),
+      client: IOClient(HttpClient()
+        ..maxConnectionsPerHost = slots
+        ..userAgent = _userAgent
+        ..connectionTimeout = const Duration(seconds: 30)),
+    );
 
 /// Fused decoder parses JSON straight from UTF-8 bytes, skipping the String.
 final _jsonUtf8 = utf8.decoder.fuse(json.decoder);
@@ -104,30 +112,22 @@ Future<void> main(List<String> args) async {
             'few are enough to saturate the link.')
     ..addFlag('all', help: 'List archives of every package, not just plugins.');
   final opts = parser.parse(args);
-  final concurrency = int.parse(opts['concurrency'] as String);
-  final archiveConcurrency = int.parse(opts['archive-concurrency'] as String);
-  final listAll = opts['all'] as bool;
+  final concurrency = int.parse(opts.option('concurrency')!);
+  final archiveConcurrency = int.parse(opts.option('archive-concurrency')!);
+  final listAll = opts.flag('all');
+  final meta = _lane(concurrency), archives = _lane(archiveConcurrency);
 
-  http.Client newClient(int maxConnections) => IOClient(HttpClient()
-    ..maxConnectionsPerHost = maxConnections
-    ..userAgent = _userAgent
-    ..connectionTimeout = const Duration(seconds: 30));
-  _metaClient = newClient(concurrency);
-  _archiveClient = newClient(archiveConcurrency);
-
-  final outFile = File(opts['out'] as String);
+  final outFile = File(opts.option('out')!);
   final done = await _loadDone(outFile);
   final out = outFile.openWrite(mode: FileMode.append);
   final failures =
-      File(opts['failures'] as String).openWrite(mode: FileMode.append);
+      File(opts.option('failures')!).openWrite(mode: FileMode.append);
 
-  final names = await _packageNames();
+  final names = await _packageNames(meta);
   final todo = names.where((n) => !done.contains(n)).toList();
   stdout.writeln('${names.length} packages, ${done.length} already done, '
       '${todo.length} to go.');
 
-  final metaPool = Pool(concurrency);
-  final archivePool = Pool(archiveConcurrency);
   // Bounds packages between "metadata started" and "line written", so records
   // waiting on the archive pool can't pile up in memory without limit.
   final inFlight = Pool(max(1000, concurrency + archiveConcurrency));
@@ -138,8 +138,7 @@ Future<void> main(List<String> args) async {
   await Future.wait(todo.map((name) => inFlight.withResource(() async {
         if (_stopping) return;
         try {
-          final record =
-              await _processPackage(name, listAll, metaPool, archivePool);
+          final record = await _processPackage(name, listAll, meta, archives);
           // Single isolate: each writeln lands as one whole line.
           out.writeln(jsonEncode(record));
           written++;
@@ -159,33 +158,22 @@ Future<void> main(List<String> args) async {
 
   await out.close();
   await failures.close();
-  _metaClient.close();
-  _archiveClient.close();
+  meta.client.close();
+  archives.client.close();
   // Signal watchers keep the process alive until cancelled.
-  for (final sub in signalSubs) {
-    await sub.cancel();
-  }
+  await Future.wait(signalSubs.map((sub) => sub.cancel()));
   final summary = '$written written, $failed failed of ${todo.length}';
-  if (_stopping) {
-    stdout.writeln('Stopped after ${sw.elapsed}: $summary. '
-        'Run again to resume.');
-  } else {
-    stdout.writeln('Done in ${sw.elapsed}: $summary.');
-  }
+  stdout.writeln(_stopping
+      ? 'Stopped after ${sw.elapsed}: $summary. Run again to resume.'
+      : 'Done in ${sw.elapsed}: $summary.');
 }
 
 Future<Map<String, Object?>> _processPackage(
-    String name, bool listAll, Pool metaPool, Pool archivePool) async {
-  // Each pool callback checks for a stop request first, so packages still
-  // queued for a slot are dropped instead of starting new downloads.
-  final meta = _jsonUtf8.convert(await metaPool.withResource(() {
-    _throwIfStopping();
-    return _get(
-      _metaClient,
-      Uri.https('pub.dev', '/api/packages/$name'),
-      headers: {'accept': 'application/vnd.pub.v2+json'},
-    );
-  })) as Map<String, dynamic>;
+    String name, bool listAll, _Lane metaLane, _Lane archiveLane) async {
+  final meta = _jsonUtf8.convert(await _get(
+          metaLane, Uri.https('pub.dev', '/api/packages/$name'),
+          headers: {'accept': 'application/vnd.pub.v2+json'}))
+      as Map<String, dynamic>;
 
   final latest = meta['latest'] as Map<String, dynamic>;
   final pubspec = latest['pubspec'] as Map<String, dynamic>;
@@ -208,10 +196,7 @@ Future<Map<String, Object?>> _processPackage(
     final archiveUrl = latest['archive_url'] as String;
     // The metadata slot is already released, so this wait doesn't block
     // other packages' metadata.
-    final bytes = await archivePool.withResource(() {
-      _throwIfStopping();
-      return _get(_archiveClient, Uri.parse(archiveUrl));
-    });
+    final bytes = await _get(archiveLane, Uri.parse(archiveUrl));
     record.addAll(await _listArchive(
         bytes, archiveUrl, latest['archive_sha256'] as String?));
   }
@@ -230,31 +215,25 @@ Future<Map<String, Object?>> _listArchive(
 
   final entries = <Map<String, Object?>>[];
   String? pubspecYaml;
-  final reader =
-      TarReader(Stream<List<int>>.value(bytes).transform(gzip.decoder));
-  try {
-    while (await reader.moveNext()) {
-      final entry = reader.current;
-      entries.add({
-        'name': entry.name,
-        'size': entry.size,
-        // Links and other special entries keep their tar type name (e.g.
-        // 'symlink') rather than being reported as files.
-        'type': switch (entry.type) {
-          TypeFlag.dir => 'dir',
-          TypeFlag.reg || TypeFlag.regA => 'file',
-          final other => other.name,
-        },
-      });
-      // Keep the raw pubspec text too (comments, key order). Unread entry
-      // contents are skipped automatically by moveNext().
-      if (entry.name == 'pubspec.yaml') {
-        pubspecYaml = await utf8.decodeStream(entry.contents);
-      }
+  await TarReader.forEach(
+      Stream<List<int>>.value(bytes).transform(gzip.decoder), (entry) async {
+    entries.add({
+      'name': entry.name,
+      'size': entry.size,
+      // Links and other special entries keep their tar type name (e.g.
+      // 'symlink') rather than being reported as files.
+      'type': switch (entry.type) {
+        TypeFlag.dir => 'dir',
+        TypeFlag.reg || TypeFlag.regA => 'file',
+        final other => other.name,
+      },
+    });
+    // Keep the raw pubspec text too (comments, key order). Unread entry
+    // contents are skipped automatically by moveNext().
+    if (entry.name == 'pubspec.yaml') {
+      pubspecYaml = await utf8.decodeStream(entry.contents);
     }
-  } finally {
-    await reader.cancel();
-  }
+  });
 
   return {
     'archive_bytes': bytes.length,
@@ -265,51 +244,55 @@ Future<Map<String, Object?>> _listArchive(
 
 final _random = Random();
 
-/// GET with status checking and exponential backoff on transient failures.
-Future<Uint8List> _get(http.Client client, Uri url,
-    {Map<String, String>? headers}) async {
-  const maxAttempts = 5;
-  for (var attempt = 1;; attempt++) {
-    try {
-      // A plain timeout on send() only stops waiting: the request carries on
-      // and its late response would hold a pooled connection forever. Abort
-      // it instead so the connection is freed.
-      final abort = Completer<void>();
-      final req = http.AbortableRequest('GET', url, abortTrigger: abort.future);
-      if (headers != null) req.headers.addAll(headers);
-      final res = await client.send(req).timeout(_idleTimeout, onTimeout: () {
-        abort.complete();
-        throw TimeoutException('No response from $url', _idleTimeout);
-      });
-      // Stream.timeout cancels the subscription (closing the connection) when
-      // it fires, unlike Future.timeout.
-      final body = res.stream.timeout(_idleTimeout);
-      if (res.statusCode == 200) {
-        final bytes = BytesBuilder(copy: false);
-        await body.forEach(bytes.add);
-        return bytes.takeBytes();
+/// GET in one of [lane]'s slots, with status checking and exponential backoff
+/// on transient failures.
+Future<Uint8List> _get(_Lane lane, Uri url,
+        {Map<String, String> headers = const {}}) =>
+    lane.pool.withResource(() async {
+      const maxAttempts = 5;
+      for (var attempt = 1;; attempt++) {
+        // Checked before every attempt, so work still queued for a slot, or
+        // backing off, when a stop is requested is left for the next run.
+        _throwIfStopping();
+        try {
+          // A plain timeout on send() only stops waiting: the request carries
+          // on and its late response would hold a pooled connection forever.
+          // Abort it instead so the connection is freed.
+          final abort = Completer<void>();
+          final req =
+              http.AbortableRequest('GET', url, abortTrigger: abort.future)
+                ..headers.addAll(headers);
+          final res =
+              await lane.client.send(req).timeout(_idleTimeout, onTimeout: () {
+            abort.complete();
+            throw TimeoutException('No response from $url', _idleTimeout);
+          });
+          // Stream.timeout cancels the subscription (closing the connection)
+          // when it fires, unlike Future.timeout.
+          final body = res.stream.timeout(_idleTimeout);
+          if (res.statusCode == 200) {
+            final bytes = BytesBuilder(copy: false);
+            await body.forEach(bytes.add);
+            return bytes.takeBytes();
+          }
+          // Drain so the connection can be reused.
+          await body.drain<void>();
+          final transient = res.statusCode == 429 || res.statusCode >= 500;
+          if (!transient || attempt == maxAttempts) {
+            throw StateError('HTTP ${res.statusCode} for $url');
+          }
+        } catch (e) {
+          // Retry socket, HTTP and TLS errors (e.g. a dropped handshake) and
+          // timeouts; anything else, including the StateError above, fails.
+          final retriable = e is IOException ||
+              e is http.ClientException ||
+              e is TimeoutException;
+          if (!retriable || attempt == maxAttempts) rethrow;
+        }
+        await _backoff(
+            Duration(milliseconds: (500 << attempt) + _random.nextInt(500)));
       }
-      // Drain so the connection can be reused.
-      await body.drain<void>();
-      final transient = res.statusCode == 429 || res.statusCode >= 500;
-      // Thrown as a StateError so the retry handlers below don't catch it.
-      if (!transient || attempt == maxAttempts) {
-        throw StateError('HTTP ${res.statusCode} for $url');
-      }
-    } on IOException {
-      // Socket, HTTP and TLS errors (e.g. a dropped handshake).
-      if (attempt == maxAttempts) rethrow;
-    } on http.ClientException {
-      if (attempt == maxAttempts) rethrow;
-    } on TimeoutException {
-      if (attempt == maxAttempts) rethrow;
-    }
-    final delayMs = 500 * pow(2, attempt) + _random.nextInt(500);
-    await _backoff(Duration(milliseconds: delayMs.toInt()));
-    // Don't retry while shutting down; leave it for the next run.
-    _throwIfStopping();
-  }
-}
+    });
 
 /// Sleeps for [duration], or less if a stop is requested meanwhile. The timer
 /// is cancelled on stop so it doesn't keep the process alive.
@@ -323,9 +306,8 @@ Future<void> _backoff(Duration duration) {
   return done.future;
 }
 
-Future<List<String>> _packageNames() async {
-  final body =
-      await _get(_metaClient, Uri.https('pub.dev', '/api/package-names'));
+Future<List<String>> _packageNames(_Lane meta) async {
+  final body = await _get(meta, Uri.https('pub.dev', '/api/package-names'));
   final json = _jsonUtf8.convert(body) as Map<String, dynamic>;
   return (json['packages'] as List).cast<String>();
 }
