@@ -125,8 +125,10 @@ Future<void> main(List<String> args) async {
 
   final names = await _packageNames(meta);
   final todo = names.where((n) => !done.contains(n)).toList();
-  stdout.writeln('${names.length} packages, ${done.length} already done, '
-      '${todo.length} to go.');
+  stdout.writeln(
+    '${names.length} packages, ${done.length} already done, '
+    '${todo.length} to go.',
+  );
 
   // Bounds packages between "metadata started" and "line written", so records
   // waiting on the archive pool can't pile up in memory without limit.
@@ -135,7 +137,9 @@ Future<void> main(List<String> args) async {
   var written = 0, failed = 0;
   final signalSubs = _watchStopSignals();
 
-  await Future.wait(todo.map((name) => inFlight.withResource(() async {
+  await Future.wait(
+    todo.map((name) {
+      return inFlight.withResource(() async {
         if (_stopping) return;
         try {
           final record = await _processPackage(name, listAll, meta, archives);
@@ -151,10 +155,13 @@ Future<void> main(List<String> args) async {
         final completed = written + failed;
         if (completed % 500 == 0) {
           final rate = completed / max(1, sw.elapsed.inSeconds);
-          stdout.writeln('$completed/${todo.length} '
-              '(${rate.toStringAsFixed(1)}/s)');
+          stdout.writeln(
+            '$completed/${todo.length} (${rate.toStringAsFixed(1)}/s)',
+          );
         }
-      })));
+      });
+    }),
+  );
 
   await out.close();
   await failures.close();
@@ -163,18 +170,26 @@ Future<void> main(List<String> args) async {
   // Signal watchers keep the process alive until cancelled.
   await Future.wait(signalSubs.map((sub) => sub.cancel()));
   final summary = '$written written, $failed failed of ${todo.length}';
-  stdout.writeln(_stopping
-      ? 'Stopped after ${sw.elapsed}: $summary. Run again to resume.'
-      : 'Done in ${sw.elapsed}: $summary.');
+  stdout.writeln(
+    _stopping
+        ? 'Stopped after ${sw.elapsed}: $summary. Run again to resume.'
+        : 'Done in ${sw.elapsed}: $summary.',
+  );
 }
 
 Future<Map<String, Object?>> _processPackage(
-    String name, bool listAll, _Lane metaLane, _Lane archiveLane) async {
-  final meta = _jsonUtf8.convert(await _get(
-          metaLane, Uri.https('pub.dev', '/api/packages/$name'),
-          headers: {'accept': 'application/vnd.pub.v2+json'}))
-      as Map<String, dynamic>;
+  String name,
+  bool listAll,
+  _Lane metaLane,
+  _Lane archiveLane,
+) async {
+  final metaResponse = await _get(
+    metaLane,
+    Uri.https('pub.dev', '/api/packages/$name'),
+    headers: {'accept': 'application/vnd.pub.v2+json'},
+  );
 
+  final meta = _jsonUtf8.convert(metaResponse) as Map<String, dynamic>;
   final latest = meta['latest'] as Map<String, dynamic>;
   final pubspec = latest['pubspec'] as Map<String, dynamic>;
   final flutter = pubspec['flutter'];
@@ -194,11 +209,12 @@ Future<Map<String, Object?>> _processPackage(
 
   if (isPlugin || listAll) {
     final archiveUrl = latest['archive_url'] as String;
+    final expectedSha = latest['archive_sha256'] as String?;
     // The metadata slot is already released, so this wait doesn't block
     // other packages' metadata.
     final bytes = await _get(archiveLane, Uri.parse(archiveUrl));
-    record.addAll(await _listArchive(
-        bytes, archiveUrl, latest['archive_sha256'] as String?));
+    final archiveRecord = await _listArchive(bytes, archiveUrl, expectedSha);
+    record.addAll(archiveRecord);
   }
   return record;
 }
@@ -208,7 +224,10 @@ Future<Map<String, Object?>> _processPackage(
 /// few MB) keeps retries clean: a dropped connection is simply retried, and
 /// nothing partial is ever written.
 Future<Map<String, Object?>> _listArchive(
-    Uint8List bytes, String url, String? expectedSha) async {
+  Uint8List bytes,
+  String url,
+  String? expectedSha,
+) async {
   if (expectedSha != null && sha256.convert(bytes).toString() != expectedSha) {
     throw StateError('sha256 mismatch for $url');
   }
@@ -216,24 +235,26 @@ Future<Map<String, Object?>> _listArchive(
   final entries = <Map<String, Object?>>[];
   String? pubspecYaml;
   await TarReader.forEach(
-      Stream<List<int>>.value(bytes).transform(gzip.decoder), (entry) async {
-    entries.add({
-      'name': entry.name,
-      'size': entry.size,
-      // Links and other special entries keep their tar type name (e.g.
-      // 'symlink') rather than being reported as files.
-      'type': switch (entry.type) {
-        TypeFlag.dir => 'dir',
-        TypeFlag.reg || TypeFlag.regA => 'file',
-        final other => other.name,
-      },
-    });
-    // Keep the raw pubspec text too (comments, key order). Unread entry
-    // contents are skipped automatically by moveNext().
-    if (entry.name == 'pubspec.yaml') {
-      pubspecYaml = await utf8.decodeStream(entry.contents);
-    }
-  });
+    Stream<List<int>>.value(bytes).transform(gzip.decoder),
+    (entry) async {
+      entries.add({
+        'name': entry.name,
+        'size': entry.size,
+        // Links and other special entries keep their tar type name (e.g.
+        // 'symlink') rather than being reported as files.
+        'type': switch (entry.type) {
+          TypeFlag.dir => 'dir',
+          TypeFlag.reg || TypeFlag.regA => 'file',
+          final other => other.name,
+        },
+      });
+      // Keep the raw pubspec text too (comments, key order). Unread entry
+      // contents are skipped automatically by moveNext().
+      if (entry.name == 'pubspec.yaml') {
+        pubspecYaml = await utf8.decodeStream(entry.contents);
+      }
+    },
+  );
 
   return {
     'archive_bytes': bytes.length,
@@ -246,53 +267,57 @@ final _random = Random();
 
 /// GET in one of [lane]'s slots, with status checking and exponential backoff
 /// on transient failures.
-Future<Uint8List> _get(_Lane lane, Uri url,
-        {Map<String, String> headers = const {}}) =>
-    lane.pool.withResource(() async {
-      const maxAttempts = 5;
-      for (var attempt = 1;; attempt++) {
-        // Checked before every attempt, so work still queued for a slot, or
-        // backing off, when a stop is requested is left for the next run.
-        _throwIfStopping();
-        try {
-          // A plain timeout on send() only stops waiting: the request carries
-          // on and its late response would hold a pooled connection forever.
-          // Abort it instead so the connection is freed.
-          final abort = Completer<void>();
-          final req =
-              http.AbortableRequest('GET', url, abortTrigger: abort.future)
-                ..headers.addAll(headers);
-          final res =
-              await lane.client.send(req).timeout(_idleTimeout, onTimeout: () {
-            abort.complete();
-            throw TimeoutException('No response from $url', _idleTimeout);
-          });
-          // Stream.timeout cancels the subscription (closing the connection)
-          // when it fires, unlike Future.timeout.
-          final body = res.stream.timeout(_idleTimeout);
-          if (res.statusCode == 200) {
-            final bytes = BytesBuilder(copy: false);
-            await body.forEach(bytes.add);
-            return bytes.takeBytes();
-          }
-          // Drain so the connection can be reused.
-          await body.drain<void>();
-          final transient = res.statusCode == 429 || res.statusCode >= 500;
-          if (!transient || attempt == maxAttempts) {
-            throw StateError('HTTP ${res.statusCode} for $url');
-          }
-        } catch (e) {
-          // Retry socket, HTTP and TLS errors (e.g. a dropped handshake) and
-          // timeouts; anything else, including the StateError above, fails.
-          final retriable = e is IOException ||
-              e is http.ClientException ||
-              e is TimeoutException;
-          if (!retriable || attempt == maxAttempts) rethrow;
+Future<Uint8List> _get(
+  _Lane lane,
+  Uri url, {
+  Map<String, String> headers = const {},
+}) {
+  return lane.pool.withResource(() async {
+    const maxAttempts = 5;
+    for (var attempt = 1;; attempt++) {
+      // Checked before every attempt, so work still queued for a slot, or
+      // backing off, when a stop is requested is left for the next run.
+      _throwIfStopping();
+      try {
+        // A plain timeout on send() only stops waiting: the request carries
+        // on and its late response would hold a pooled connection forever.
+        // Abort it instead so the connection is freed.
+        final abort = Completer<void>();
+        final req =
+            http.AbortableRequest('GET', url, abortTrigger: abort.future)
+              ..headers.addAll(headers);
+        final res =
+            await lane.client.send(req).timeout(_idleTimeout, onTimeout: () {
+          abort.complete();
+          throw TimeoutException('No response from $url', _idleTimeout);
+        });
+        // Stream.timeout cancels the subscription (closing the connection)
+        // when it fires, unlike Future.timeout.
+        final body = res.stream.timeout(_idleTimeout);
+        if (res.statusCode == 200) {
+          final bytes = BytesBuilder(copy: false);
+          await body.forEach(bytes.add);
+          return bytes.takeBytes();
         }
-        await _backoff(
-            Duration(milliseconds: (500 << attempt) + _random.nextInt(500)));
+        // Drain so the connection can be reused.
+        await body.drain<void>();
+        final transient = res.statusCode == 429 || res.statusCode >= 500;
+        if (!transient || attempt == maxAttempts) {
+          throw StateError('HTTP ${res.statusCode} for $url');
+        }
+      } catch (e) {
+        // Retry socket, HTTP and TLS errors (e.g. a dropped handshake) and
+        // timeouts; anything else, including the StateError above, fails.
+        final retriable = e is IOException ||
+            e is http.ClientException ||
+            e is TimeoutException;
+        if (!retriable || attempt == maxAttempts) rethrow;
       }
-    });
+      final backoffMs = (500 << attempt) + _random.nextInt(500);
+      await _backoff(Duration(milliseconds: backoffMs));
+    }
+  });
+}
 
 /// Sleeps for [duration], or less if a stop is requested meanwhile. The timer
 /// is cancelled on stop so it doesn't keep the process alive.
