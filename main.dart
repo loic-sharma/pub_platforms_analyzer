@@ -225,7 +225,8 @@ Future<Map<String, Object?>> _processPackage(
 }
 
 /// The package's pub points, likes, 30-day downloads and tags, or null if
-/// pub.dev has no score for it (404).
+/// pub.dev has no score for it (404). Keys are converted to snake_case
+/// (`downloadCount30Days` -> `download_count_30_days`) to match the record.
 Future<Map<String, dynamic>?> _score(_Lane lane, String name) async {
   try {
     final body = await _get(
@@ -233,12 +234,23 @@ Future<Map<String, dynamic>?> _score(_Lane lane, String name) async {
       Uri.https('pub.dev', '/api/packages/$name/score'),
       headers: {'accept': 'application/vnd.pub.v2+json'},
     );
-    return _jsonUtf8.convert(body) as Map<String, dynamic>;
+    final score = _jsonUtf8.convert(body) as Map<String, dynamic>;
+    return {
+      for (final MapEntry(:key, :value) in score.entries)
+        _snakeCase(key): value,
+    };
   } on _HttpStatusException catch (e) {
     if (e.statusCode == 404) return null;
     rethrow;
   }
 }
+
+/// Splits before each capital letter and each run of digits:
+/// `grantedPoints` -> `granted_points`, `downloadCount30Days` ->
+/// `download_count_30_days`.
+String _snakeCase(String camel) => camel
+    .replaceAll(RegExp(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=[0-9])'), '_')
+    .toLowerCase();
 
 /// Checks the downloaded archive's hash, then streams through gzip + tar
 /// without extracting. Buffering the *compressed* bytes (typically KBs to a

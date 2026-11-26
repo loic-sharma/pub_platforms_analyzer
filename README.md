@@ -24,7 +24,7 @@ CREATE VIEW pub AS SELECT * FROM read_json('pub.jsonl', columns = {
 
 ```sql
 SELECT id,
-  json_extract(score, '$.downloadCount30Days')::BIGINT AS downloads_30d,
+  json_extract(score, '$.download_count_30_days')::BIGINT AS downloads_30d,
   json_keys(pubspec, '$.platforms') AS dart_platforms,
   CASE WHEN is_plugin
     THEN json_keys(pubspec, '$.flutter.plugin.platforms')
@@ -98,14 +98,14 @@ archive_bytes | int | Size of the compressed `.tar.gz` archive, in bytes. Missin
 
 #### Score object
 
-This object contains the package's score from `/api/packages/<name>/score`.
+This object contains the package's score from `/api/packages/<name>/score`, with keys converted to snake case.
 
 Column name | Data type | Description
 -- | -- | --
-grantedPoints | int | Pub points granted by pana
-maxPoints | int | Maximum pub points available
-likeCount | int | Number of likes
-downloadCount30Days | int | Downloads over the last 30 days. Null for some packages, e.g. ones published very recently
+granted_points | int | Pub points granted by pana
+max_points | int | Maximum pub points available
+like_count | int | Number of likes
+download_count_30_days | int | Downloads over the last 30 days. Null for some packages, e.g. ones published very recently
 tags | Array of strings | Package tags, e.g. `sdk:flutter`, `platform:android`, `is:dart3-compatible`, `license:mit`
 
 ### Entries object
