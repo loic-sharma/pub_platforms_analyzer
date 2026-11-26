@@ -76,6 +76,29 @@ GROUP BY flutter_platform
 ORDER BY packages DESC, flutter_platform;
 ```
 
+### Keys under `flutter.plugins.<platform>`
+
+```sql
+WITH platforms AS (
+  SELECT id, pubspec,
+    unnest(json_keys(pubspec, '$.flutter.plugin.platforms')) AS platform
+  FROM pub
+  WHERE json_type(pubspec, '$.flutter.plugin.platforms') = 'OBJECT'
+), keys AS (
+  SELECT id, platform,
+    unnest(json_keys(pubspec, '$.flutter.plugin.platforms."' || platform || '"')) AS key
+  FROM platforms
+  WHERE json_type(pubspec, '$.flutter.plugin.platforms."' || platform || '"') = 'OBJECT'
+)
+SELECT key,
+  list(DISTINCT platform ORDER BY platform) AS platforms,
+  count(*) AS occurrences,
+  count(DISTINCT id) AS packages
+FROM keys
+GROUP BY key
+ORDER BY occurrences DESC, key;
+```
+
 # Tables
 
 ### pub.jsonl
