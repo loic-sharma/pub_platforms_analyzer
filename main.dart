@@ -1,7 +1,8 @@
 /// Crawls pub.dev and writes ONE JSON line per package to a single JSONL file.
 ///
-/// For every package: fetch metadata (pubspec of every version comes for free)
-/// and its score (pub points, likes, downloads, tags; null if pub.dev has none).
+/// For every package: fetch metadata (the latest version's pubspec and the
+/// version count are written) and its score (pub points, likes, downloads,
+/// tags; null if pub.dev has none).
 /// For plugins (or every package with --all): download the latest archive,
 /// verify its sha256, and list its tar entries in memory. Nothing is extracted
 /// and no per-package files are written.
@@ -29,6 +30,8 @@
 ///   FROM (SELECT id, pubspec, unnest(entries) AS e
 ///         FROM read_json_auto('pub.jsonl') WHERE is_plugin)
 ///   GROUP BY id;
+/// read_json_auto may infer pubspec as a STRUCT that varies across rows; the
+/// README's typed view reads it as JSON.
 library;
 
 import 'dart:async';
@@ -120,15 +123,17 @@ Future<void> main(List<String> args) async {
 
   final outFile = File(opts.option('out')!);
   final done = await _loadDone(outFile);
+  final names = await _packageNames(meta);
+  final todo = names.where((n) => !done.contains(n)).toList();
+  // Opened only once the package list is in, so an early network failure
+  // leaves no empty files behind.
   final out = outFile.openWrite(mode: FileMode.append);
   final failures =
       File(opts.option('failures')!).openWrite(mode: FileMode.append);
-
-  final names = await _packageNames(meta);
-  final todo = names.where((n) => !done.contains(n)).toList();
+  // Not done.length: the output may hold packages since removed from pub.
+  final completed = names.length - todo.length;
   stdout.writeln(
-    '${names.length} packages, ${done.length} already done, '
-    '${todo.length} to go.',
+    '${names.length} packages, $completed already done, ${todo.length} to go.',
   );
 
   // Bounds packages between "metadata started" and "line written", so records
@@ -190,20 +195,24 @@ Future<Map<String, Object?>> _processPackage(
     headers: {'accept': 'application/vnd.pub.v2+json'},
   );
 
+  // Take what we need before awaiting the score: the full map holds every
+  // version's pubspec and shouldn't be kept alive while queued for a slot.
   final meta = _jsonUtf8.convert(metaResponse) as Map<String, dynamic>;
-  final score = await _score(metaLane, name);
   final latest = meta['latest'] as Map<String, dynamic>;
+  final isDiscontinued = meta['isDiscontinued'] ?? false;
+  final versionCount = (meta['versions'] as List).length;
   final pubspec = latest['pubspec'] as Map<String, dynamic>;
   final flutter = pubspec['flutter'];
   final isPlugin = flutter is Map && flutter['plugin'] != null;
+  final score = await _score(metaLane, name);
 
   final record = <String, Object?>{
     'id': name,
     'version': latest['version'],
     'published': latest['published'],
     'is_plugin': isPlugin,
-    'is_discontinued': meta['isDiscontinued'] ?? false,
-    'version_count': (meta['versions'] as List).length,
+    'is_discontinued': isDiscontinued,
+    'version_count': versionCount,
     // Only in records written since scores were added; older lines lack the
     // key (DuckDB reads it as NULL either way).
     'score': score,
@@ -248,9 +257,10 @@ Future<Map<String, dynamic>?> _score(_Lane lane, String name) async {
 /// Splits before each capital letter and each run of digits:
 /// `grantedPoints` -> `granted_points`, `downloadCount30Days` ->
 /// `download_count_30_days`.
-String _snakeCase(String camel) => camel
-    .replaceAll(RegExp(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=[0-9])'), '_')
-    .toLowerCase();
+String _snakeCase(String camel) =>
+    camel.replaceAll(_wordBoundary, '_').toLowerCase();
+
+final _wordBoundary = RegExp(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=[0-9])');
 
 /// Checks the downloaded archive's hash, then streams through gzip + tar
 /// without extracting. Buffering the *compressed* bytes (typically KBs to a
@@ -268,7 +278,10 @@ Future<Map<String, Object?>> _listArchive(
   final entries = <Map<String, Object?>>[];
   String? pubspecYaml;
   await TarReader.forEach(
-    Stream<List<int>>.value(bytes).transform(gzip.decoder),
+    // Fed in chunks so TarReader's backpressure paces decompression; a single
+    // chunk would be inflated in full, in memory, before tar reads any of it.
+    Stream<List<int>>.fromIterable(_chunks(bytes, 1 << 16))
+        .transform(gzip.decoder),
     (entry) async {
       entries.add({
         'name': entry.name,
@@ -294,6 +307,13 @@ Future<Map<String, Object?>> _listArchive(
     'entries': entries,
     'pubspec_yaml': pubspecYaml,
   };
+}
+
+/// Views of [bytes] at most [size] long, without copying.
+Iterable<Uint8List> _chunks(Uint8List bytes, int size) sync* {
+  for (var i = 0; i < bytes.length; i += size) {
+    yield Uint8List.sublistView(bytes, i, min(i + size, bytes.length));
+  }
 }
 
 final _random = Random();
@@ -324,8 +344,9 @@ Future<Uint8List> _get(
           abort.complete();
           throw TimeoutException('No response from $url', _idleTimeout);
         });
-        // Stream.timeout cancels the subscription (closing the connection)
-        // when it fires, unlike Future.timeout.
+        // On idle, Stream.timeout emits a TimeoutException; forEach and drain
+        // listen with cancelOnError, so the subscription is cancelled and the
+        // connection closed (unlike Future.timeout, which only stops waiting).
         final body = res.stream.timeout(_idleTimeout);
         if (res.statusCode == 200) {
           final bytes = BytesBuilder(copy: false);
