@@ -1,4 +1,6 @@
-# Usage
+# Pub platforms analyzer
+
+## Usage
 
 ```sh
 dart run main.dart [--out pub.jsonl] [--concurrency 32] [--archive-concurrency 4] [--all]
@@ -10,7 +12,7 @@ Output with timestamps:
 dart run main.dart --out "data/$(date +%F)-pub.jsonl" --failures "data/$(date +%F)-failures.jsonl"
 ```
 
-# Queries
+## Queries
 
 Run this first to create a typed view of the data:
 
@@ -99,7 +101,7 @@ GROUP BY key
 ORDER BY occurrences DESC, key;
 ```
 
-# Tables
+## Tables
 
 ### pub.jsonl
 

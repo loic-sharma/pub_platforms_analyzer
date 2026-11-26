@@ -1,15 +1,16 @@
-/// Crawls pub.dev and writes ONE JSON line per package to a single JSONL file.
-///
-/// For every package: fetch metadata (the latest version's pubspec and the
-/// version count are written) and its score (pub points, likes, downloads,
-/// tags; null if pub.dev has none).
-/// For plugins (or every package with --all): download the latest archive,
-/// verify its sha256, and list its tar entries in memory. Nothing is extracted
-/// and no per-package files are written.
+/// Crawls pub.dev and writes a JSON line per package to a single JSONL file.
 ///
 /// Usage:
 ///   dart run main.dart --out pub.jsonl [--concurrency 32]
 ///       [--archive-concurrency 4] [--all]
+///
+/// For every package: fetch metadata (the latest version's pubspec and the
+/// version count are written) and its score (pub points, likes, downloads,
+/// tags; null if pub.dev has none).
+///
+/// For plugins (or every package with --all): download the latest archive,
+/// verify its sha256, and list its tar entries in memory. Nothing is extracted
+/// and no per-package files are written.
 ///
 /// Metadata requests are small and latency-bound; archive downloads are large
 /// and bandwidth-bound. They run in separate pools on separate connections so
@@ -18,20 +19,11 @@
 /// Safe to stop and restart: packages already in the output file are skipped.
 /// That includes packages written by a run without --all, so to list every
 /// archive, start --all with a fresh --out file.
+///
 /// Ctrl+C (or SIGTERM) stops cleanly: no new requests start, downloads already
 /// running finish and are written, then the process exits. A second Ctrl+C
 /// quits immediately; at worst a partial last line is left, which the next run
 /// truncates.
-///
-/// Query with DuckDB, e.g. top-level folders vs. declared platforms:
-///   SELECT id,
-///     list(DISTINCT split_part(e.name, '/', 1)) FILTER (WHERE e.name LIKE '%/%') AS top_dirs,
-///     json_keys(any_value(pubspec), '$.flutter.plugin.platforms') AS declared
-///   FROM (SELECT id, pubspec, unnest(entries) AS e
-///         FROM read_json_auto('pub.jsonl') WHERE is_plugin)
-///   GROUP BY id;
-/// read_json_auto may infer pubspec as a STRUCT that varies across rows; the
-/// README's typed view reads it as JSON.
 library;
 
 import 'dart:async';
@@ -47,7 +39,7 @@ import 'package:http/io_client.dart';
 import 'package:pool/pool.dart';
 import 'package:tar/tar.dart';
 
-const _userAgent = 'pub_insights/1.0 (+mailto:sharma.loic@gmail.com)';
+const _userAgent = 'pub_platforms_analyzer/1.0';
 
 /// A request fails if no bytes arrive for this long. Unlike a timeout on the
 /// whole request, this never aborts a large archive that is still downloading.

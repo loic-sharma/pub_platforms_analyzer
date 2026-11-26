@@ -1,4 +1,4 @@
-name: pub_insights_2
+name: pub_platforms_analyzer
 description: Streams pub.dev package metadata and archive listings into one JSONL file.
 publish_to: none
 
