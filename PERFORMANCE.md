@@ -80,6 +80,17 @@ So:
    and be downloaded again on every retry, wasting the scarce resource.
    Non-200 response bodies are now read to the end so their connections can be
    reused.
+
+   **Keep timeouts from leaking connections.** `Future.timeout` only stops
+   *waiting*. On `client.send(...)` the request carries on, and its late
+   response is never listened to, so it holds one of the few pooled
+   connections indefinitely (with 4 archive slots, each leak is a 25%
+   throughput loss). `_get` therefore uses `http.AbortableRequest` and
+   completes the abort trigger on timeout (needs `http` ≥ 1.5.0). For bodies,
+   use `stream.timeout(...)`, which cancels the subscription, never
+   `drain().timeout(...)`. Verified with a local server that never sends
+   headers and `maxConnectionsPerHost = 1`: the old code left the next request
+   with no connection; the new one serves it immediately.
 5. **Fused `utf8.decoder.fuse(json.decoder)`** parses JSON straight from bytes.
    This is a minor CPU saving.
 6. **`_loadDone` streams the output file.** It finds the last newline by
@@ -90,13 +101,14 @@ So:
 
 7. **Clean shutdown on Ctrl+C / SIGTERM.** The `inFlight` buffer means up to
    ~1000 packages can be partly done at any moment, and killing the process
-   threw that work away. Now the first signal sets `_stopping`: packages still
-   waiting for a pool slot are dropped (via `_Stopped`, which is not recorded
-   as a failure), retries stop instead of sleeping through backoff, and only
-   requests already sent are finished and written. Measured: exit 9–11 s after
-   the signal (the wait is the 4 archive downloads in progress), no partial or
-   duplicate lines. A second signal calls `exit(130)` at once; the next run
-   truncates any partial line.
+   threw that work away. Now the first signal completes `_stopRequested`:
+   packages still waiting for a pool slot are dropped (via `_Stopped`, which
+   is not recorded as a failure), a retry backoff in progress is cut short
+   and not retried (`_backoff` also cancels its timer so it can't keep the
+   process alive), and only requests already sent are finished and written.
+   Measured: exit 9–11 s after the signal (the wait is the 4 archive downloads
+   in progress), no partial or duplicate lines. A second signal exits at once
+   with 130 (SIGINT) or 143 (SIGTERM); the next run truncates any partial line.
 
 ## How to benchmark
 
@@ -197,7 +209,7 @@ twice.
 
 And check shutdown: send one SIGINT or SIGTERM after ~20 s and confirm exit
 code 0 within seconds, a "Stopped after" line, no partial last line, and no
-new failures. Send two signals a second apart and confirm exit code 130
+new failures. Send two SIGINTs a second apart and confirm exit code 130
 almost immediately.
 
 ## Ideas not yet tried

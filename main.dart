@@ -14,6 +14,8 @@
 /// a few big archives can saturate the link without starving metadata.
 ///
 /// Safe to stop and restart: packages already in the output file are skipped.
+/// That includes packages written by a run without --all, so to list every
+/// archive, start --all with a fresh --out file.
 /// Ctrl+C (or SIGTERM) stops cleanly: no new requests start, downloads already
 /// running finish and are written, then the process exits. A second Ctrl+C
 /// quits immediately; at worst a partial last line is left, which the next run
@@ -55,9 +57,10 @@ late final http.Client _archiveClient;
 /// Fused decoder parses JSON straight from UTF-8 bytes, skipping the String.
 final _jsonUtf8 = utf8.decoder.fuse(json.decoder);
 
-/// Set by the first Ctrl+C / SIGTERM. Work that hasn't sent its request yet
-/// checks this and bails out with [_Stopped].
-var _stopping = false;
+/// Completed by the first Ctrl+C / SIGTERM. Work that hasn't sent its request
+/// yet checks [_stopping] and bails out with [_Stopped].
+final _stopRequested = Completer<void>();
+bool get _stopping => _stopRequested.isCompleted;
 
 /// Thrown instead of starting a request once [_stopping] is set. Not a failure:
 /// the package is simply left for the next run.
@@ -74,9 +77,10 @@ List<StreamSubscription<ProcessSignal>> _watchStopSignals() {
   void onSignal(ProcessSignal signal) {
     if (_stopping) {
       stderr.writeln('Second $signal: quitting immediately.');
-      exit(130);
+      // Conventional 128 + signal number.
+      exit(signal == ProcessSignal.sigterm ? 143 : 130);
     }
-    _stopping = true;
+    _stopRequested.complete();
     stderr.writeln('$signal: finishing requests already in progress, then '
         'exiting. Press Ctrl+C again to quit immediately.');
   }
@@ -128,7 +132,7 @@ Future<void> main(List<String> args) async {
   // waiting on the archive pool can't pile up in memory without limit.
   final inFlight = Pool(max(1000, concurrency + archiveConcurrency));
   final sw = Stopwatch()..start();
-  var completed = 0;
+  var written = 0, failed = 0;
   final signalSubs = _watchStopSignals();
 
   await Future.wait(todo.map((name) => inFlight.withResource(() async {
@@ -138,12 +142,15 @@ Future<void> main(List<String> args) async {
               await _processPackage(name, listAll, metaPool, archivePool);
           // Single isolate: each writeln lands as one whole line.
           out.writeln(jsonEncode(record));
+          written++;
         } on _Stopped {
           return;
         } catch (e) {
           failures.writeln(jsonEncode({'id': name, 'error': '$e'}));
+          failed++;
         }
-        if (++completed % 500 == 0) {
+        final completed = written + failed;
+        if (completed % 500 == 0) {
           final rate = completed / max(1, sw.elapsed.inSeconds);
           stdout.writeln('$completed/${todo.length} '
               '(${rate.toStringAsFixed(1)}/s)');
@@ -158,11 +165,12 @@ Future<void> main(List<String> args) async {
   for (final sub in signalSubs) {
     await sub.cancel();
   }
+  final summary = '$written written, $failed failed of ${todo.length}';
   if (_stopping) {
-    stdout.writeln('Stopped after ${sw.elapsed}: $completed of '
-        '${todo.length} done this run. Run again to resume.');
+    stdout.writeln('Stopped after ${sw.elapsed}: $summary. '
+        'Run again to resume.');
   } else {
-    stdout.writeln('Done in ${sw.elapsed}.');
+    stdout.writeln('Done in ${sw.elapsed}: $summary.');
   }
 }
 
@@ -197,17 +205,15 @@ Future<Map<String, Object?>> _processPackage(
   };
 
   if (isPlugin || listAll) {
+    final archiveUrl = latest['archive_url'] as String;
     // The metadata slot is already released, so this wait doesn't block
     // other packages' metadata.
     final bytes = await archivePool.withResource(() {
       _throwIfStopping();
-      return _get(_archiveClient, Uri.parse(latest['archive_url'] as String));
+      return _get(_archiveClient, Uri.parse(archiveUrl));
     });
     record.addAll(await _listArchive(
-      bytes,
-      latest['archive_url'] as String,
-      latest['archive_sha256'] as String?,
-    ));
+        bytes, archiveUrl, latest['archive_sha256'] as String?));
   }
   return record;
 }
@@ -232,7 +238,13 @@ Future<Map<String, Object?>> _listArchive(
       entries.add({
         'name': entry.name,
         'size': entry.size,
-        'type': entry.type == TypeFlag.dir ? 'dir' : 'file',
+        // Links and other special entries keep their tar type name (e.g.
+        // 'symlink') rather than being reported as files.
+        'type': switch (entry.type) {
+          TypeFlag.dir => 'dir',
+          TypeFlag.reg || TypeFlag.regA => 'file',
+          final other => other.name,
+        },
       });
       // Keep the raw pubspec text too (comments, key order). Unread entry
       // contents are skipped automatically by moveNext().
@@ -259,35 +271,56 @@ Future<Uint8List> _get(http.Client client, Uri url,
   const maxAttempts = 5;
   for (var attempt = 1;; attempt++) {
     try {
-      final req = http.Request('GET', url);
+      // A plain timeout on send() only stops waiting: the request carries on
+      // and its late response would hold a pooled connection forever. Abort
+      // it instead so the connection is freed.
+      final abort = Completer<void>();
+      final req = http.AbortableRequest('GET', url, abortTrigger: abort.future);
       if (headers != null) req.headers.addAll(headers);
-      final res = await client.send(req).timeout(_idleTimeout);
+      final res = await client.send(req).timeout(_idleTimeout, onTimeout: () {
+        abort.complete();
+        throw TimeoutException('No response from $url', _idleTimeout);
+      });
+      // Stream.timeout cancels the subscription (closing the connection) when
+      // it fires, unlike Future.timeout.
+      final body = res.stream.timeout(_idleTimeout);
       if (res.statusCode == 200) {
-        final body = BytesBuilder(copy: false);
-        await res.stream.timeout(_idleTimeout).forEach(body.add);
-        return body.takeBytes();
+        final bytes = BytesBuilder(copy: false);
+        await body.forEach(bytes.add);
+        return bytes.takeBytes();
       }
       // Drain so the connection can be reused.
-      await res.stream.drain<void>().timeout(_idleTimeout);
+      await body.drain<void>();
       final transient = res.statusCode == 429 || res.statusCode >= 500;
       // Thrown as a StateError so the retry handlers below don't catch it.
       if (!transient || attempt == maxAttempts) {
         throw StateError('HTTP ${res.statusCode} for $url');
       }
-    } on HttpException {
-      if (attempt == maxAttempts) rethrow;
-    } on SocketException {
-      if (attempt == maxAttempts) rethrow;
-    } on TimeoutException {
+    } on IOException {
+      // Socket, HTTP and TLS errors (e.g. a dropped handshake).
       if (attempt == maxAttempts) rethrow;
     } on http.ClientException {
       if (attempt == maxAttempts) rethrow;
+    } on TimeoutException {
+      if (attempt == maxAttempts) rethrow;
     }
-    // Don't sleep and retry while shutting down; leave it for the next run.
-    _throwIfStopping();
     final delayMs = 500 * pow(2, attempt) + _random.nextInt(500);
-    await Future<void>.delayed(Duration(milliseconds: delayMs.toInt()));
+    await _backoff(Duration(milliseconds: delayMs.toInt()));
+    // Don't retry while shutting down; leave it for the next run.
+    _throwIfStopping();
   }
+}
+
+/// Sleeps for [duration], or less if a stop is requested meanwhile. The timer
+/// is cancelled on stop so it doesn't keep the process alive.
+Future<void> _backoff(Duration duration) {
+  final done = Completer<void>();
+  final timer = Timer(duration, done.complete);
+  _stopRequested.future.then((_) {
+    timer.cancel();
+    if (!done.isCompleted) done.complete();
+  });
+  return done.future;
 }
 
 Future<List<String>> _packageNames() async {
