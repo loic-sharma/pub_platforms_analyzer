@@ -1,7 +1,13 @@
 # Usage
 
 ```sh
-dart run main.dart --out pub.jsonl [--concurrency 32] [--archive-concurrency 4] [--all]
+dart run main.dart [--out pub.jsonl] [--concurrency 32] [--archive-concurrency 4] [--all]
+```
+
+Output with timestamps:
+
+```sh
+dart run main.dart --out "data/$(date +%F)-pub.jsonl" --failures "data/$(date +%F)-failures.jsonl"
 ```
 
 # Queries
@@ -69,3 +75,45 @@ FROM (
 GROUP BY flutter_platform
 ORDER BY packages DESC, flutter_platform;
 ```
+
+# Tables
+
+### pub.jsonl
+
+This table contains one row per package, describing its latest version. Each line is one JSON object.
+
+Column name | Data type | Description
+-- | -- | --
+id | String | Package name, e.g. `http`. Unique. Good for joins
+version | String | Latest version, e.g. `1.6.0`
+published | String | UTC timestamp when the latest version was published, ISO 8601 (e.g. `2024-10-05T16:15:30.055291Z`)
+is_plugin | Bool | Whether the latest pubspec declares a Flutter plugin (`flutter.plugin`)
+is_discontinued | Bool | Whether the package is marked discontinued
+version_count | int | Number of published versions
+score | Object | Package score, see [Score object](#score-object)
+pubspec | Object | Latest version's pubspec, as JSON. Query with `json_extract`, e.g. `'$.flutter.plugin.platforms'`
+entries | Array of objects | Files in the latest version's archive, see [entries](#entries-object). Null unless the package is a plugin (or the crawl used `--all`)
+pubspec_yaml | String | Raw `pubspec.yaml` text from the archive, with comments and key order. Null when `entries` is null
+archive_bytes | int | Size of the compressed `.tar.gz` archive, in bytes. Missing when `entries` is null
+
+#### Score object
+
+This object contains the package's score from `/api/packages/<name>/score`.
+
+Column name | Data type | Description
+-- | -- | --
+grantedPoints | int | Pub points granted by pana
+maxPoints | int | Maximum pub points available
+likeCount | int | Number of likes
+downloadCount30Days | int | Downloads over the last 30 days. Null for some packages, e.g. ones published very recently
+tags | Array of strings | Package tags, e.g. `sdk:flutter`, `platform:android`, `is:dart3-compatible`, `license:mit`
+
+### Entries object
+
+This array contains one object per tar entry in the latest version's archive. Entries are listed, not extracted.
+
+Column name | Data type | Description
+-- | -- | --
+name | String | Path relative to the package root, e.g. `lib/src/client.dart`
+size | int | Uncompressed size in bytes. 0 for directories
+type | String | `file`, `dir`, or another tar entry type such as `symlink` or `link`

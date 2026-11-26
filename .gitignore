@@ -7,3 +7,7 @@ main
 main.exe
 
 .DS_Store
+
+# Crawl output: keep the folder, not the (large) data files.
+data/*
+!data/.gitkeep
