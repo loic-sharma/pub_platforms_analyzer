@@ -1,0 +1,9 @@
+# Dart tool output (package config, build cache).
+.dart_tool/
+build/
+
+# Binaries from `dart compile exe main.dart`.
+main
+main.exe
+
+.DS_Store
