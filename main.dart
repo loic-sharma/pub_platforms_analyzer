@@ -47,12 +47,14 @@ final _defaultBaseUri = Uri.https('pub.dev');
 typedef Lane = ({Pool pool, http.Client client});
 
 Lane createLane(int slots) => (
-      pool: Pool(slots),
-      client: IOClient(HttpClient()
-        ..maxConnectionsPerHost = slots
-        ..userAgent = 'pub_platforms_analyzer/1.0'
-        ..connectionTimeout = const Duration(seconds: 30)),
-    );
+  pool: Pool(slots),
+  client: IOClient(
+    HttpClient()
+      ..maxConnectionsPerHost = slots
+      ..userAgent = 'pub_platforms_analyzer/1.0'
+      ..connectionTimeout = const Duration(seconds: 30),
+  ),
+);
 
 /// Fused decoder parses JSON straight from UTF-8 bytes, skipping the String.
 final _jsonUtf8 = utf8.decoder.fuse(json.decoder);
@@ -85,8 +87,10 @@ List<StreamSubscription<ProcessSignal>> _watchStopSignals(
       exit(signal == ProcessSignal.sigterm ? 143 : 130);
     }
     stopRequested.complete();
-    stderr.writeln('$signal: finishing requests already in progress, then '
-        'exiting. Press Ctrl+C again to quit immediately.');
+    stderr.writeln(
+      '$signal: finishing requests already in progress, then '
+      'exiting. Press Ctrl+C again to quit immediately.',
+    );
   }
 
   return [
@@ -100,12 +104,18 @@ Future<void> main(List<String> args) async {
   final parser = ArgParser()
     ..addOption('out', defaultsTo: 'pub.jsonl')
     ..addOption('failures', defaultsTo: 'failures.jsonl')
-    ..addOption('concurrency',
-        defaultsTo: '32', help: 'Concurrent metadata requests.')
-    ..addOption('archive-concurrency',
-        defaultsTo: '4',
-        help: 'Concurrent archive downloads. These are bandwidth-bound, so a '
-            'few are enough to saturate the link.')
+    ..addOption(
+      'concurrency',
+      defaultsTo: '32',
+      help: 'Concurrent metadata requests.',
+    )
+    ..addOption(
+      'archive-concurrency',
+      defaultsTo: '4',
+      help:
+          'Concurrent archive downloads. These are bandwidth-bound, so a '
+          'few are enough to saturate the link.',
+    )
     ..addFlag('all', help: 'List archives of every package, not just plugins.')
     ..addOption('base-url', defaultsTo: _defaultBaseUri.toString(), hide: true);
   final opts = parser.parse(args);
@@ -134,10 +144,10 @@ class Crawler {
     Duration Function(int attempt)? backoffDelay,
     Completer<void>? stopRequested,
     void Function(String line)? log,
-  })  : baseUri = baseUri ?? _defaultBaseUri,
-        _backoffDelay = backoffDelay,
-        stopRequested = stopRequested ?? Completer<void>(),
-        _log = log ?? stdout.writeln;
+  }) : baseUri = baseUri ?? _defaultBaseUri,
+       _backoffDelay = backoffDelay,
+       stopRequested = stopRequested ?? Completer<void>(),
+       _log = log ?? stdout.writeln;
 
   final Uri baseUri;
 
@@ -191,8 +201,12 @@ class Crawler {
           return inFlight.withResource(() async {
             if (_stopping) return;
             try {
-              final record =
-                  await processPackage(name, listAll, meta, archives);
+              final record = await processPackage(
+                name,
+                listAll,
+                meta,
+                archives,
+              );
               // Single isolate: each writeln lands as one whole line.
               out!.writeln(jsonEncode(record));
               written++;
@@ -205,9 +219,7 @@ class Crawler {
             final completed = written + failed;
             if (completed % 500 == 0) {
               final rate = completed / max(1, sw.elapsed.inSeconds);
-              _log(
-                '$completed/${todo.length} (${rate.toStringAsFixed(1)}/s)',
-              );
+              _log('$completed/${todo.length} (${rate.toStringAsFixed(1)}/s)');
             }
           });
         }),
@@ -311,7 +323,7 @@ class Crawler {
   }) {
     return lane.pool.withResource(() async {
       const maxAttempts = 5;
-      for (var attempt = 1;; attempt++) {
+      for (var attempt = 1; ; attempt++) {
         // Checked before every attempt, so work still queued for a slot, or
         // backing off, when a stop is requested is left for the next run.
         _throwIfStopping();
@@ -320,14 +332,20 @@ class Crawler {
           // on and its late response would hold a pooled connection forever.
           // Abort it instead so the connection is freed.
           final abort = Completer<void>();
-          final req =
-              http.AbortableRequest('GET', url, abortTrigger: abort.future)
-                ..headers.addAll(headers);
-          final res =
-              await lane.client.send(req).timeout(idleTimeout, onTimeout: () {
-            abort.complete();
-            throw TimeoutException('No response from $url', idleTimeout);
-          });
+          final req = http.AbortableRequest(
+            'GET',
+            url,
+            abortTrigger: abort.future,
+          )..headers.addAll(headers);
+          final res = await lane.client
+              .send(req)
+              .timeout(
+                idleTimeout,
+                onTimeout: () {
+                  abort.complete();
+                  throw TimeoutException('No response from $url', idleTimeout);
+                },
+              );
           // On idle, Stream.timeout emits a TimeoutException; forEach and drain
           // listen with cancelOnError, so the subscription is cancelled and the
           // connection closed (unlike Future.timeout, which only stops waiting).
@@ -346,7 +364,8 @@ class Crawler {
         } catch (e) {
           // Retry socket, HTTP and TLS errors (e.g. a dropped handshake) and
           // timeouts; anything else, including the status error above, fails.
-          final retriable = e is IOException ||
+          final retriable =
+              e is IOException ||
               e is http.ClientException ||
               e is TimeoutException;
           if (!retriable || attempt == maxAttempts) rethrow;
@@ -471,16 +490,20 @@ Future<Set<String>> loadDone(File file) async {
   // Records are written with "id" first and package names never need JSON
   // escaping, so the id can be sliced out without decoding the whole line.
   const prefix = '{"id":"';
-  await for (final line in file
-      .openRead()
-      .transform(utf8.decoder)
-      .transform(const LineSplitter())) {
+  await for (final line
+      in file
+          .openRead()
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())) {
     if (line.isEmpty) continue;
-    final close =
-        line.startsWith(prefix) ? line.indexOf('"', prefix.length) : -1;
-    done.add(close > 0
-        ? line.substring(prefix.length, close)
-        : (jsonDecode(line) as Map<String, dynamic>)['id'] as String);
+    final close = line.startsWith(prefix)
+        ? line.indexOf('"', prefix.length)
+        : -1;
+    done.add(
+      close > 0
+          ? line.substring(prefix.length, close)
+          : (jsonDecode(line) as Map<String, dynamic>)['id'] as String,
+    );
   }
   return done;
 }
