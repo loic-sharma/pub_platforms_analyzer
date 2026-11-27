@@ -26,7 +26,7 @@ dart run main.dart --out "data/$(date +%F)-pub.jsonl" --failures "data/$(date +%
 
 **Output data**
 - One line per package; `"id"` must be the **first key** of every record.
-  `_loadDone` reads ids from the `{"id":"` line prefix to resume without
+  `loadDone` reads ids from the `{"id":"` line prefix to resume without
   decoding lines.
 - Existing lines are never rewritten. Output changes apply only to newly
   written rows, so a file can mix old and new shapes. When changing the
@@ -38,44 +38,34 @@ dart run main.dart --out "data/$(date +%F)-pub.jsonl" --failures "data/$(date +%
 
 **Performance and robustness** (benchmarked or bug fixes; details in
 PERFORMANCE.md)
-- Metadata and archives use separate "lanes" (`_Lane` = Pool + its own
+- Metadata and archives use separate "lanes" (`Lane` = Pool + its own
   HttpClient): `--concurrency 32` for metadata and score requests,
   `--archive-concurrency 4` for archives. 4 saturated both a ~4 MB/s and a
   ~10 MB/s link; more streams only slow metadata down.
 - `inFlight` pool (≥1000) caps packages between "metadata started" and "line
   written".
-- `_get`: abort the request on a `send` timeout (`AbortableRequest`; a plain
+- `getBytes`: abort the request on a `send` timeout (`AbortableRequest`; a plain
   `Future.timeout` leaks the pooled connection); use `stream.timeout` for
   bodies, including the non-200 drain; timeouts are *idle* timeouts (60 s with
   no bytes), not total; retry only IOException / ClientException /
-  TimeoutException; non-retried statuses throw `_HttpStatusException`.
-- Shutdown: first SIGINT/SIGTERM completes `_stopRequested`. Queued work
-  throws `_Stopped` (not a failure), `_backoff` is cut short and cancels its
-  timer, and in-flight requests finish and are written. A second signal
+  TimeoutException; non-retried statuses throw `HttpStatusException`.
+- Shutdown: first SIGINT/SIGTERM completes `stopRequested`. Queued work
+  throws `StoppedException` (not a failure), `_backoff` is cut short and cancels
+  its timer, and in-flight requests finish and are written. A second signal
   exits with 130/143. Signal subscriptions must be cancelled at the end or the
   process won't exit.
 
-## Testing (there is no test suite)
+## Testing
 
-- **Never hit pub.dev hard, and never point `--out` at real data.** Use short
-  time-boxed runs (20–60 s) writing to a scratch directory. Don't run two
-  crawlers at once; they share the bandwidth.
-- **Unit-style checks of private functions:** copy `main.dart` to a temp file
-  *inside the project directory* (package imports only resolve there), rename
-  `main` to `realMain` with sed, append a test `main()` that calls `_get`,
-  `_lane`, `_score`, etc. against a local `HttpServer` (stall, 503, 404
-  routes), run it, then delete the temp file. Shorten `_idleTimeout` with sed
-  for timeout tests. A useful check: with `_lane(1)`, a stalled request that
-  times out must not block the next request on the single connection.
+- Run the automated test suite with `dart test` (uses local `HttpServer`
+  fixtures; never hits pub.dev).
+- **Never hit pub.dev hard, and never point `--out` at real data.** When doing
+  manual live checks, use short time-boxed runs (20–60 s) writing to a scratch
+  directory. Don't run two crawlers at once; they share the bandwidth.
 - **Output equality:** compare records for ids present in both an old and a
   new run (parse the JSON, compare dicts). Differences in `version`,
   `version_count`, `published` or `pubspec` usually mean the package
   released a new version in between, not a bug.
-- **Resume:** copy a real output file, append a partial line, run briefly, and
-  check the "already done" count, that the partial line is gone, that there
-  are no duplicate ids, and that the original bytes are unchanged.
-- **Shutdown:** one signal → exit 0 within seconds, no partial line; two
-  signals → exit 130/143 at once.
 - **Throughput:** measure MB/s from the interface byte counter
   (`netstat -ibn -I en0`), not completed downloads (that undercounts high
   concurrency). Alternate the order of variants; the CDN makes repeat runs
@@ -83,7 +73,7 @@ PERFORMANCE.md)
 - macOS gotchas: there is no `timeout` command; background jobs in a
   non-interactive bash ignore SIGINT for binaries that don't watch it (use
   `kill -TERM`).
-- Run `dart format main.dart` and `dart analyze` after edits.
+- Run `dart format .`, `dart analyze --fatal-infos`, and `dart test` after edits.
 
 ## Environment
 

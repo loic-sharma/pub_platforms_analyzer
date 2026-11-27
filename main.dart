@@ -39,52 +39,52 @@ import 'package:http/io_client.dart';
 import 'package:pool/pool.dart';
 import 'package:tar/tar.dart';
 
-const _userAgent = 'pub_platforms_analyzer/1.0';
-
-/// A request fails if no bytes arrive for this long. Unlike a timeout on the
-/// whole request, this never aborts a large archive that is still downloading.
-const _idleTimeout = Duration(seconds: 60);
+final _defaultBaseUri = Uri.https('pub.dev');
 
 /// A pool of request slots with its own keep-alive HttpClient holding as many
 /// connections, so archive downloads never hold the connections that metadata
 /// requests need.
-typedef _Lane = ({Pool pool, http.Client client});
+typedef Lane = ({Pool pool, http.Client client});
 
-_Lane _lane(int slots) => (
+Lane createLane(int slots) => (
       pool: Pool(slots),
       client: IOClient(HttpClient()
         ..maxConnectionsPerHost = slots
-        ..userAgent = _userAgent
+        ..userAgent = 'pub_platforms_analyzer/1.0'
         ..connectionTimeout = const Duration(seconds: 30)),
     );
 
 /// Fused decoder parses JSON straight from UTF-8 bytes, skipping the String.
 final _jsonUtf8 = utf8.decoder.fuse(json.decoder);
 
-/// Completed by the first Ctrl+C / SIGTERM. Work that hasn't sent its request
-/// yet checks [_stopping] and bails out with [_Stopped].
-final _stopRequested = Completer<void>();
-bool get _stopping => _stopRequested.isCompleted;
+final _random = Random();
 
-/// Thrown instead of starting a request once [_stopping] is set. Not a failure:
-/// the package is simply left for the next run.
-class _Stopped implements Exception {
-  const _Stopped();
-}
+/// Thrown instead of starting a request once a stop is requested. Not a
+/// failure: the package is simply left for the next run.
+class const StoppedException() implements Exception;
 
-void _throwIfStopping() {
-  if (_stopping) throw const _Stopped();
+/// A non-200 response that wasn't retried (or ran out of retries).
+class HttpStatusException implements Exception {
+  HttpStatusException(this.statusCode, this.url);
+
+  final int statusCode;
+  final Uri url;
+
+  @override
+  String toString() => 'HTTP $statusCode for $url';
 }
 
 /// First signal: stop starting new work. Second signal: exit now.
-List<StreamSubscription<ProcessSignal>> _watchStopSignals() {
+List<StreamSubscription<ProcessSignal>> _watchStopSignals(
+  Completer<void> stopRequested,
+) {
   void onSignal(ProcessSignal signal) {
-    if (_stopping) {
+    if (stopRequested.isCompleted) {
       stderr.writeln('Second $signal: quitting immediately.');
       // Conventional 128 + signal number.
       exit(signal == ProcessSignal.sigterm ? 143 : 130);
     }
-    _stopRequested.complete();
+    stopRequested.complete();
     stderr.writeln('$signal: finishing requests already in progress, then '
         'exiting. Press Ctrl+C again to quit immediately.');
   }
@@ -106,150 +106,283 @@ Future<void> main(List<String> args) async {
         defaultsTo: '4',
         help: 'Concurrent archive downloads. These are bandwidth-bound, so a '
             'few are enough to saturate the link.')
-    ..addFlag('all', help: 'List archives of every package, not just plugins.');
+    ..addFlag('all', help: 'List archives of every package, not just plugins.')
+    ..addOption('base-url', defaultsTo: _defaultBaseUri.toString(), hide: true);
   final opts = parser.parse(args);
-  final concurrency = int.parse(opts.option('concurrency')!);
-  final archiveConcurrency = int.parse(opts.option('archive-concurrency')!);
-  final listAll = opts.flag('all');
-  final meta = _lane(concurrency), archives = _lane(archiveConcurrency);
-
-  final outFile = File(opts.option('out')!);
-  final done = await _loadDone(outFile);
-  final names = await _packageNames(meta);
-  final todo = names.where((n) => !done.contains(n)).toList();
-  // Opened only once the package list is in, so an early network failure
-  // leaves no empty files behind.
-  final out = outFile.openWrite(mode: FileMode.append);
-  final failures =
-      File(opts.option('failures')!).openWrite(mode: FileMode.append);
-  // Not done.length: the output may hold packages since removed from pub.
-  final completed = names.length - todo.length;
-  stdout.writeln(
-    '${names.length} packages, $completed already done, ${todo.length} to go.',
-  );
-
-  // Bounds packages between "metadata started" and "line written", so records
-  // waiting on the archive pool can't pile up in memory without limit.
-  final inFlight = Pool(max(1000, concurrency + archiveConcurrency));
-  final sw = Stopwatch()..start();
-  var written = 0, failed = 0;
-  final signalSubs = _watchStopSignals();
-
-  await Future.wait(
-    todo.map((name) {
-      return inFlight.withResource(() async {
-        if (_stopping) return;
-        try {
-          final record = await _processPackage(name, listAll, meta, archives);
-          // Single isolate: each writeln lands as one whole line.
-          out.writeln(jsonEncode(record));
-          written++;
-        } on _Stopped {
-          return;
-        } catch (e) {
-          failures.writeln(jsonEncode({'id': name, 'error': '$e'}));
-          failed++;
-        }
-        final completed = written + failed;
-        if (completed % 500 == 0) {
-          final rate = completed / max(1, sw.elapsed.inSeconds);
-          stdout.writeln(
-            '$completed/${todo.length} (${rate.toStringAsFixed(1)}/s)',
-          );
-        }
-      });
-    }),
-  );
-
-  await out.close();
-  await failures.close();
-  meta.client.close();
-  archives.client.close();
-  // Signal watchers keep the process alive until cancelled.
-  await Future.wait(signalSubs.map((sub) => sub.cancel()));
-  final summary = '$written written, $failed failed of ${todo.length}';
-  stdout.writeln(
-    _stopping
-        ? 'Stopped after ${sw.elapsed}: $summary. Run again to resume.'
-        : 'Done in ${sw.elapsed}: $summary.',
-  );
-}
-
-Future<Map<String, Object?>> _processPackage(
-  String name,
-  bool listAll,
-  _Lane metaLane,
-  _Lane archiveLane,
-) async {
-  final metaResponse = await _get(
-    metaLane,
-    Uri.https('pub.dev', '/api/packages/$name'),
-    headers: {'accept': 'application/vnd.pub.v2+json'},
-  );
-
-  // Take what we need before awaiting the score: the full map holds every
-  // version's pubspec and shouldn't be kept alive while queued for a slot.
-  final meta = _jsonUtf8.convert(metaResponse) as Map<String, dynamic>;
-  final latest = meta['latest'] as Map<String, dynamic>;
-  final isDiscontinued = meta['isDiscontinued'] ?? false;
-  final versionCount = (meta['versions'] as List).length;
-  final pubspec = latest['pubspec'] as Map<String, dynamic>;
-  final flutter = pubspec['flutter'];
-  final isPlugin = flutter is Map && flutter['plugin'] != null;
-  final score = await _score(metaLane, name);
-
-  final record = <String, Object?>{
-    'id': name,
-    'version': latest['version'],
-    'published': latest['published'],
-    'is_plugin': isPlugin,
-    'is_discontinued': isDiscontinued,
-    'version_count': versionCount,
-    // Only in records written since scores were added; older lines lack the
-    // key (DuckDB reads it as NULL either way).
-    'score': score,
-    'pubspec': pubspec,
-    'entries': null,
-    'pubspec_yaml': null,
-  };
-
-  if (isPlugin || listAll) {
-    final archiveUrl = latest['archive_url'] as String;
-    final expectedSha = latest['archive_sha256'] as String?;
-    // The metadata slot is already released, so this wait doesn't block
-    // other packages' metadata.
-    final bytes = await _get(archiveLane, Uri.parse(archiveUrl));
-    final archiveRecord = await _listArchive(bytes, archiveUrl, expectedSha);
-    record.addAll(archiveRecord);
-  }
-  return record;
-}
-
-/// The package's pub points, likes, 30-day downloads and tags, or null if
-/// pub.dev has no score for it (404). Keys are converted to snake_case
-/// (`downloadCount30Days` -> `download_count_30_days`) to match the record.
-Future<Map<String, dynamic>?> _score(_Lane lane, String name) async {
+  final crawler = Crawler(baseUri: Uri.parse(opts.option('base-url')!));
+  final signalSubs = _watchStopSignals(crawler.stopRequested);
   try {
-    final body = await _get(
-      lane,
-      Uri.https('pub.dev', '/api/packages/$name/score'),
+    await crawler.run(
+      outFile: File(opts.option('out')!),
+      failuresFile: File(opts.option('failures')!),
+      concurrency: int.parse(opts.option('concurrency')!),
+      archiveConcurrency: int.parse(opts.option('archive-concurrency')!),
+      listAll: opts.flag('all'),
+    );
+  } on StoppedException {
+    // Stopped before the crawl loop started.
+  } finally {
+    // Signal watchers keep the process alive until cancelled.
+    await Future.wait(signalSubs.map((sub) => sub.cancel()));
+  }
+}
+
+class Crawler {
+  Crawler({
+    Uri? baseUri,
+    this.idleTimeout = const Duration(seconds: 60),
+    Duration Function(int attempt)? backoffDelay,
+    Completer<void>? stopRequested,
+    void Function(String line)? log,
+  })  : baseUri = baseUri ?? _defaultBaseUri,
+        _backoffDelay = backoffDelay,
+        stopRequested = stopRequested ?? Completer<void>(),
+        _log = log ?? stdout.writeln;
+
+  final Uri baseUri;
+
+  /// A request fails if no bytes arrive for this long. Unlike a timeout on the
+  /// whole request, this never aborts a large archive that is still downloading.
+  final Duration idleTimeout;
+  final Duration Function(int attempt)? _backoffDelay;
+  final Completer<void> stopRequested;
+  final void Function(String line) _log;
+
+  bool get _stopping => stopRequested.isCompleted;
+
+  void _throwIfStopping() {
+    if (_stopping) throw const StoppedException();
+  }
+
+  Future<({int written, int failed, int total, int skipped})> run({
+    required File outFile,
+    required File failuresFile,
+    int concurrency = 32,
+    int archiveConcurrency = 4,
+    bool listAll = false,
+  }) async {
+    final meta = createLane(concurrency);
+    final archives = createLane(archiveConcurrency);
+    IOSink? out;
+    IOSink? failures;
+    try {
+      final done = await loadDone(outFile);
+      final names = await _packageNames(meta);
+      final todo = names.where((n) => !done.contains(n)).toList();
+      // Opened only once the package list is in, so an early network failure
+      // leaves no empty files behind.
+      out = outFile.openWrite(mode: FileMode.append);
+      failures = failuresFile.openWrite(mode: FileMode.append);
+      // Not done.length: the output may hold packages since removed from pub.
+      final skipped = names.length - todo.length;
+      _log(
+        '${names.length} packages, $skipped already done, ${todo.length} to go.',
+      );
+
+      // Bounds packages between "metadata started" and "line written", so
+      // records waiting on the archive pool can't pile up in memory without
+      // limit.
+      final inFlight = Pool(max(1000, concurrency + archiveConcurrency));
+      final sw = Stopwatch()..start();
+      var written = 0, failed = 0;
+
+      await Future.wait(
+        todo.map((name) {
+          return inFlight.withResource(() async {
+            if (_stopping) return;
+            try {
+              final record =
+                  await processPackage(name, listAll, meta, archives);
+              // Single isolate: each writeln lands as one whole line.
+              out!.writeln(jsonEncode(record));
+              written++;
+            } on StoppedException {
+              return;
+            } catch (e) {
+              failures!.writeln(jsonEncode({'id': name, 'error': '$e'}));
+              failed++;
+            }
+            final completed = written + failed;
+            if (completed % 500 == 0) {
+              final rate = completed / max(1, sw.elapsed.inSeconds);
+              _log(
+                '$completed/${todo.length} (${rate.toStringAsFixed(1)}/s)',
+              );
+            }
+          });
+        }),
+      );
+
+      final summary = '$written written, $failed failed of ${todo.length}';
+      _log(
+        _stopping
+            ? 'Stopped after ${sw.elapsed}: $summary. Run again to resume.'
+            : 'Done in ${sw.elapsed}: $summary.',
+      );
+      return (
+        written: written,
+        failed: failed,
+        total: names.length,
+        skipped: skipped,
+      );
+    } finally {
+      await out?.close();
+      await failures?.close();
+      meta.client.close();
+      archives.client.close();
+    }
+  }
+
+  Future<Map<String, Object?>> processPackage(
+    String name,
+    bool listAll,
+    Lane metaLane,
+    Lane archiveLane,
+  ) async {
+    final metaResponse = await getBytes(
+      metaLane,
+      baseUri.resolve('/api/packages/$name'),
       headers: {'accept': 'application/vnd.pub.v2+json'},
     );
-    final score = _jsonUtf8.convert(body) as Map<String, dynamic>;
-    return {
-      for (final MapEntry(:key, :value) in score.entries)
-        _snakeCase(key): value,
+
+    // Take what we need before awaiting the score: the full map holds every
+    // version's pubspec and shouldn't be kept alive while queued for a slot.
+    final meta = _jsonUtf8.convert(metaResponse) as Map<String, dynamic>;
+    final latest = meta['latest'] as Map<String, dynamic>;
+    final isDiscontinued = meta['isDiscontinued'] ?? false;
+    final versionCount = (meta['versions'] as List).length;
+    final pubspec = latest['pubspec'] as Map<String, dynamic>;
+    final flutter = pubspec['flutter'];
+    final isPlugin = flutter is Map && flutter['plugin'] != null;
+    final score = await fetchScore(metaLane, name);
+
+    final record = <String, Object?>{
+      'id': name,
+      'version': latest['version'],
+      'published': latest['published'],
+      'is_plugin': isPlugin,
+      'is_discontinued': isDiscontinued,
+      'version_count': versionCount,
+      'score': score,
+      'pubspec': pubspec,
+      'entries': null,
+      'pubspec_yaml': null,
     };
-  } on _HttpStatusException catch (e) {
-    if (e.statusCode == 404) return null;
-    rethrow;
+
+    if (isPlugin || listAll) {
+      final archiveUrl = latest['archive_url'] as String;
+      final expectedSha = latest['archive_sha256'] as String?;
+      // The metadata slot is already released, so this wait doesn't block
+      // other packages' metadata.
+      final bytes = await getBytes(archiveLane, Uri.parse(archiveUrl));
+      final archiveRecord = await listArchive(bytes, archiveUrl, expectedSha);
+      record.addAll(archiveRecord);
+    }
+    return record;
+  }
+
+  /// The package's pub points, likes, 30-day downloads and tags, or null if
+  /// pub.dev has no score for it (404). Keys are converted to snake_case
+  /// (`downloadCount30Days` -> `download_count_30_days`) to match the record.
+  Future<Map<String, dynamic>?> fetchScore(Lane lane, String name) async {
+    try {
+      final body = await getBytes(
+        lane,
+        baseUri.resolve('/api/packages/$name/score'),
+        headers: {'accept': 'application/vnd.pub.v2+json'},
+      );
+      final score = _jsonUtf8.convert(body) as Map<String, dynamic>;
+      return {
+        for (final MapEntry(:key, :value) in score.entries)
+          snakeCase(key): value,
+      };
+    } on HttpStatusException catch (e) {
+      if (e.statusCode == 404) return null;
+      rethrow;
+    }
+  }
+
+  /// GET in one of [lane]'s slots, with status checking and exponential backoff
+  /// on transient failures.
+  Future<Uint8List> getBytes(
+    Lane lane,
+    Uri url, {
+    Map<String, String> headers = const {},
+  }) {
+    return lane.pool.withResource(() async {
+      const maxAttempts = 5;
+      for (var attempt = 1;; attempt++) {
+        // Checked before every attempt, so work still queued for a slot, or
+        // backing off, when a stop is requested is left for the next run.
+        _throwIfStopping();
+        try {
+          // A plain timeout on send() only stops waiting: the request carries
+          // on and its late response would hold a pooled connection forever.
+          // Abort it instead so the connection is freed.
+          final abort = Completer<void>();
+          final req =
+              http.AbortableRequest('GET', url, abortTrigger: abort.future)
+                ..headers.addAll(headers);
+          final res =
+              await lane.client.send(req).timeout(idleTimeout, onTimeout: () {
+            abort.complete();
+            throw TimeoutException('No response from $url', idleTimeout);
+          });
+          // On idle, Stream.timeout emits a TimeoutException; forEach and drain
+          // listen with cancelOnError, so the subscription is cancelled and the
+          // connection closed (unlike Future.timeout, which only stops waiting).
+          final body = res.stream.timeout(idleTimeout);
+          if (res.statusCode == 200) {
+            final bytes = BytesBuilder(copy: false);
+            await body.forEach(bytes.add);
+            return bytes.takeBytes();
+          }
+          // Drain so the connection can be reused.
+          await body.drain<void>();
+          final transient = res.statusCode == 429 || res.statusCode >= 500;
+          if (!transient || attempt == maxAttempts) {
+            throw HttpStatusException(res.statusCode, url);
+          }
+        } catch (e) {
+          // Retry socket, HTTP and TLS errors (e.g. a dropped handshake) and
+          // timeouts; anything else, including the status error above, fails.
+          final retriable = e is IOException ||
+              e is http.ClientException ||
+              e is TimeoutException;
+          if (!retriable || attempt == maxAttempts) rethrow;
+        }
+        final delay = _backoffDelay != null
+            ? _backoffDelay(attempt)
+            : Duration(milliseconds: (500 << attempt) + _random.nextInt(500));
+        await _backoff(delay);
+      }
+    });
+  }
+
+  /// Sleeps for [duration], or less if a stop is requested meanwhile. The timer
+  /// is cancelled on stop so it doesn't keep the process alive.
+  Future<void> _backoff(Duration duration) {
+    if (_stopping) return Future<void>.value();
+    final done = Completer<void>();
+    final timer = Timer(duration, done.complete);
+    stopRequested.future.then((_) {
+      timer.cancel();
+      if (!done.isCompleted) done.complete();
+    });
+    return done.future;
+  }
+
+  Future<List<String>> _packageNames(Lane meta) async {
+    final body = await getBytes(meta, baseUri.resolve('/api/package-names'));
+    final json = _jsonUtf8.convert(body) as Map<String, dynamic>;
+    return (json['packages'] as List).cast<String>();
   }
 }
 
 /// Splits before each capital letter and each run of digits:
 /// `grantedPoints` -> `granted_points`, `downloadCount30Days` ->
 /// `download_count_30_days`.
-String _snakeCase(String camel) =>
+String snakeCase(String camel) =>
     camel.replaceAll(_wordBoundary, '_').toLowerCase();
 
 final _wordBoundary = RegExp(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=[0-9])');
@@ -258,7 +391,7 @@ final _wordBoundary = RegExp(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=[0-9])');
 /// without extracting. Buffering the *compressed* bytes (typically KBs to a
 /// few MB) keeps retries clean: a dropped connection is simply retried, and
 /// nothing partial is ever written.
-Future<Map<String, Object?>> _listArchive(
+Future<Map<String, Object?>> listArchive(
   Uint8List bytes,
   String url,
   String? expectedSha,
@@ -272,7 +405,7 @@ Future<Map<String, Object?>> _listArchive(
   await TarReader.forEach(
     // Fed in chunks so TarReader's backpressure paces decompression; a single
     // chunk would be inflated in full, in memory, before tar reads any of it.
-    Stream<List<int>>.fromIterable(_chunks(bytes, 1 << 16))
+    Stream<List<int>>.fromIterable(chunks(bytes, 1 << 16))
         .transform(gzip.decoder),
     (entry) async {
       entries.add({
@@ -302,101 +435,15 @@ Future<Map<String, Object?>> _listArchive(
 }
 
 /// Views of [bytes] at most [size] long, without copying.
-Iterable<Uint8List> _chunks(Uint8List bytes, int size) sync* {
+Iterable<Uint8List> chunks(Uint8List bytes, int size) sync* {
   for (var i = 0; i < bytes.length; i += size) {
     yield Uint8List.sublistView(bytes, i, min(i + size, bytes.length));
   }
 }
 
-final _random = Random();
-
-/// GET in one of [lane]'s slots, with status checking and exponential backoff
-/// on transient failures.
-Future<Uint8List> _get(
-  _Lane lane,
-  Uri url, {
-  Map<String, String> headers = const {},
-}) {
-  return lane.pool.withResource(() async {
-    const maxAttempts = 5;
-    for (var attempt = 1;; attempt++) {
-      // Checked before every attempt, so work still queued for a slot, or
-      // backing off, when a stop is requested is left for the next run.
-      _throwIfStopping();
-      try {
-        // A plain timeout on send() only stops waiting: the request carries
-        // on and its late response would hold a pooled connection forever.
-        // Abort it instead so the connection is freed.
-        final abort = Completer<void>();
-        final req =
-            http.AbortableRequest('GET', url, abortTrigger: abort.future)
-              ..headers.addAll(headers);
-        final res =
-            await lane.client.send(req).timeout(_idleTimeout, onTimeout: () {
-          abort.complete();
-          throw TimeoutException('No response from $url', _idleTimeout);
-        });
-        // On idle, Stream.timeout emits a TimeoutException; forEach and drain
-        // listen with cancelOnError, so the subscription is cancelled and the
-        // connection closed (unlike Future.timeout, which only stops waiting).
-        final body = res.stream.timeout(_idleTimeout);
-        if (res.statusCode == 200) {
-          final bytes = BytesBuilder(copy: false);
-          await body.forEach(bytes.add);
-          return bytes.takeBytes();
-        }
-        // Drain so the connection can be reused.
-        await body.drain<void>();
-        final transient = res.statusCode == 429 || res.statusCode >= 500;
-        if (!transient || attempt == maxAttempts) {
-          throw _HttpStatusException(res.statusCode, url);
-        }
-      } catch (e) {
-        // Retry socket, HTTP and TLS errors (e.g. a dropped handshake) and
-        // timeouts; anything else, including the status error above, fails.
-        final retriable = e is IOException ||
-            e is http.ClientException ||
-            e is TimeoutException;
-        if (!retriable || attempt == maxAttempts) rethrow;
-      }
-      final backoffMs = (500 << attempt) + _random.nextInt(500);
-      await _backoff(Duration(milliseconds: backoffMs));
-    }
-  });
-}
-
-/// A non-200 response that wasn't retried (or ran out of retries).
-class _HttpStatusException implements Exception {
-  _HttpStatusException(this.statusCode, this.url);
-
-  final int statusCode;
-  final Uri url;
-
-  @override
-  String toString() => 'HTTP $statusCode for $url';
-}
-
-/// Sleeps for [duration], or less if a stop is requested meanwhile. The timer
-/// is cancelled on stop so it doesn't keep the process alive.
-Future<void> _backoff(Duration duration) {
-  final done = Completer<void>();
-  final timer = Timer(duration, done.complete);
-  _stopRequested.future.then((_) {
-    timer.cancel();
-    if (!done.isCompleted) done.complete();
-  });
-  return done.future;
-}
-
-Future<List<String>> _packageNames(_Lane meta) async {
-  final body = await _get(meta, Uri.https('pub.dev', '/api/package-names'));
-  final json = _jsonUtf8.convert(body) as Map<String, dynamic>;
-  return (json['packages'] as List).cast<String>();
-}
-
 /// Reads ids already in the output so a restart resumes where it stopped.
 /// If the last run died mid-line, truncates the partial line first.
-Future<Set<String>> _loadDone(File file) async {
+Future<Set<String>> loadDone(File file) async {
   final done = <String>{};
   if (!await file.exists()) return done;
 
