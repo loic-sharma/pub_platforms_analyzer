@@ -158,147 +158,178 @@ void main() {
       expect(await empty.length(), 0);
     });
 
-    test('reads ids via fast prefix, JSON fallback, and skips blank lines',
-        () async {
-      final dir = await createTempDir();
-      final file = File('${dir.path}/out.jsonl');
-      await file.writeAsString(
-        '{"id":"alpha","version":"1.0.0"}\n'
-        '\n'
-        '{"version":"2.0.0","id":"beta"}\n'
-        '{"id":"gamma_2","is_plugin":true}\n',
-      );
-      expect(await loadDone(file), {'alpha', 'beta', 'gamma_2'});
-    });
+    test(
+      'reads ids via fast prefix, JSON fallback, and skips blank lines',
+      () async {
+        final dir = await createTempDir();
+        final file = File('${dir.path}/out.jsonl');
+        await file.writeAsString(
+          '{"id":"alpha","version":"1.0.0"}\n'
+          '\n'
+          '{"version":"2.0.0","id":"beta"}\n'
+          '{"id":"gamma_2","is_plugin":true}\n',
+        );
+        expect(await loadDone(file), {'alpha', 'beta', 'gamma_2'});
+      },
+    );
 
     test(
-        'truncates trailing partial line and preserves complete lines verbatim',
-        () async {
-      final dir = await createTempDir();
-      final file = File('${dir.path}/partial.jsonl');
-      const valid = '{"id":"one","v":1}\n{"id":"two","v":2}\n';
-      await file.writeAsString('$valid{"id":"three","v":');
+      'truncates trailing partial line and preserves complete lines verbatim',
+      () async {
+        final dir = await createTempDir();
+        final file = File('${dir.path}/partial.jsonl');
+        const valid = '{"id":"one","v":1}\n{"id":"two","v":2}\n';
+        await file.writeAsString('$valid{"id":"three","v":');
 
-      expect(await loadDone(file), {'one', 'two'});
-      expect(await file.readAsString(), valid);
-    });
+        expect(await loadDone(file), {'one', 'two'});
+        expect(await file.readAsString(), valid);
+      },
+    );
 
-    test('truncates file to empty when single line has no trailing newline',
-        () async {
-      final dir = await createTempDir();
-      final file = File('${dir.path}/single_partial.jsonl');
-      await file.writeAsString('{"id":"truncated"');
+    test(
+      'truncates file to empty when single line has no trailing newline',
+      () async {
+        final dir = await createTempDir();
+        final file = File('${dir.path}/single_partial.jsonl');
+        await file.writeAsString('{"id":"truncated"');
 
-      expect(await loadDone(file), isEmpty);
-      expect(await file.length(), 0);
-    });
+        expect(await loadDone(file), isEmpty);
+        expect(await file.length(), 0);
+      },
+    );
 
-    test('handles partial line longer than 64 KiB backwards scan chunk',
-        () async {
-      final dir = await createTempDir();
-      final file = File('${dir.path}/large_partial.jsonl');
-      const valid = '{"id":"kept_pkg","version":"1.0.0"}\n';
-      await file.writeAsString('$valid{"id":"partial","pad":"${'x' * 140000}"');
+    test(
+      'handles partial line longer than 64 KiB backwards scan chunk',
+      () async {
+        final dir = await createTempDir();
+        final file = File('${dir.path}/large_partial.jsonl');
+        const valid = '{"id":"kept_pkg","version":"1.0.0"}\n';
+        await file.writeAsString(
+          '$valid{"id":"partial","pad":"${'x' * 140000}"',
+        );
 
-      expect(await loadDone(file), {'kept_pkg'});
-      expect(await file.readAsString(), valid);
-    });
+        expect(await loadDone(file), {'kept_pkg'});
+        expect(await file.readAsString(), valid);
+      },
+    );
   });
 
   group('listArchive', () {
-    test('lists entries, maps types, extracts pubspec.yaml, verifies sha256',
-        () async {
-      const rawPubspec = '# Comment preserved\nname: demo\nversion: 1.0.0\n';
-      final bytes = await buildTarGz([
-        TarEntry.data(
-          TarHeader(name: 'lib/', mode: 493, typeFlag: TypeFlag.dir),
-          const [],
-        ),
-        tarFile('lib/demo.dart', 'void main() {}\n'),
-        tarFile('pubspec.yaml', rawPubspec),
-        TarEntry.data(
-          TarHeader(
-            name: 'lib/alias.dart',
-            mode: 420,
-            typeFlag: TypeFlag.symlink,
-            linkName: 'demo.dart',
+    test(
+      'lists entries, maps types, extracts pubspec.yaml, verifies sha256',
+      () async {
+        const rawPubspec = '# Comment preserved\nname: demo\nversion: 1.0.0\n';
+        final bytes = await buildTarGz([
+          TarEntry.data(
+            TarHeader(name: 'lib/', mode: 493, typeFlag: TypeFlag.dir),
+            const [],
           ),
-          const [],
-        ),
-        TarEntry.data(
-          TarHeader(
-            name: 'lib/hard.dart',
-            mode: 420,
-            typeFlag: TypeFlag.link,
-            linkName: 'lib/demo.dart',
+          tarFile('lib/demo.dart', 'void main() {}\n'),
+          tarFile('pubspec.yaml', rawPubspec),
+          TarEntry.data(
+            TarHeader(
+              name: 'lib/alias.dart',
+              mode: 420,
+              typeFlag: TypeFlag.symlink,
+              linkName: 'demo.dart',
+            ),
+            const [],
           ),
-          const [],
-        ),
-      ]);
-      final digest = sha256.convert(bytes).toString();
+          TarEntry.data(
+            TarHeader(
+              name: 'lib/hard.dart',
+              mode: 420,
+              typeFlag: TypeFlag.link,
+              linkName: 'lib/demo.dart',
+            ),
+            const [],
+          ),
+        ]);
+        final digest = sha256.convert(bytes).toString();
 
-      final result =
-          await listArchive(bytes, 'https://example.test/demo.tar.gz', digest);
-      expect(result['archive_bytes'], bytes.length);
-      expect(result['pubspec_yaml'], rawPubspec);
-      expect(result['entries'], [
-        {'name': 'lib/', 'size': 0, 'type': 'dir'},
-        {'name': 'lib/demo.dart', 'size': 15, 'type': 'file'},
-        {'name': 'pubspec.yaml', 'size': rawPubspec.length, 'type': 'file'},
-        {'name': 'lib/alias.dart', 'size': 0, 'type': 'symlink'},
-        {'name': 'lib/hard.dart', 'size': 0, 'type': 'link'},
-      ]);
-    });
+        final result = await listArchive(
+          bytes,
+          'https://example.test/demo.tar.gz',
+          digest,
+        );
+        expect(result['archive_bytes'], bytes.length);
+        expect(result['pubspec_yaml'], rawPubspec);
+        expect(result['entries'], [
+          {'name': 'lib/', 'size': 0, 'type': 'dir'},
+          {'name': 'lib/demo.dart', 'size': 15, 'type': 'file'},
+          {'name': 'pubspec.yaml', 'size': rawPubspec.length, 'type': 'file'},
+          {'name': 'lib/alias.dart', 'size': 0, 'type': 'symlink'},
+          {'name': 'lib/hard.dart', 'size': 0, 'type': 'link'},
+        ]);
+      },
+    );
 
-    test('returns null pubspec_yaml when archive has no pubspec.yaml',
-        () async {
-      final bytes = await buildTarGz([tarFile('README.md', 'hi')]);
-      final result =
-          await listArchive(bytes, 'https://example.test/a.tar.gz', null);
-      expect(result['pubspec_yaml'], isNull);
-      expect(result['entries'], [
-        {'name': 'README.md', 'size': 2, 'type': 'file'},
-      ]);
-    });
+    test(
+      'returns null pubspec_yaml when archive has no pubspec.yaml',
+      () async {
+        final bytes = await buildTarGz([tarFile('README.md', 'hi')]);
+        final result = await listArchive(
+          bytes,
+          'https://example.test/a.tar.gz',
+          null,
+        );
+        expect(result['pubspec_yaml'], isNull);
+        expect(result['entries'], [
+          {'name': 'README.md', 'size': 2, 'type': 'file'},
+        ]);
+      },
+    );
 
-    test('throws StateError on sha256 mismatch and throws on corrupt gzip',
-        () async {
-      final bytes = await buildTarGz([tarFile('a.txt', 'x')]);
-      await expectLater(
-        listArchive(bytes, 'https://example.test/bad.tar.gz', '0000'),
-        throwsA(isA<StateError>()
-            .having((e) => e.message, 'message', contains('sha256 mismatch'))),
-      );
-      await expectLater(
-        listArchive(Uint8List.fromList([1, 2, 3, 4, 5]),
-            'https://example.test/corrupt.tar.gz', null),
-        throwsA(anything),
-      );
-    });
+    test(
+      'throws StateError on sha256 mismatch and throws on corrupt gzip',
+      () async {
+        final bytes = await buildTarGz([tarFile('a.txt', 'x')]);
+        await expectLater(
+          listArchive(bytes, 'https://example.test/bad.tar.gz', '0000'),
+          throwsA(
+            isA<StateError>().having(
+              (e) => e.message,
+              'message',
+              contains('sha256 mismatch'),
+            ),
+          ),
+        );
+        await expectLater(
+          listArchive(
+            Uint8List.fromList([1, 2, 3, 4, 5]),
+            'https://example.test/corrupt.tar.gz',
+            null,
+          ),
+          throwsA(anything),
+        );
+      },
+    );
   });
 
   group('getBytes & Lane', () {
-    test('returns body on 200 and sends User-Agent and custom headers',
-        () async {
-      String? seenUserAgent;
-      String? seenAccept;
-      final baseUri = await startServer((req) async {
-        seenUserAgent = req.headers.value(HttpHeaders.userAgentHeader);
-        seenAccept = req.headers.value(HttpHeaders.acceptHeader);
-        req.response.write('hello');
-        await req.response.close();
-      });
+    test(
+      'returns body on 200 and sends User-Agent and custom headers',
+      () async {
+        String? seenUserAgent;
+        String? seenAccept;
+        final baseUri = await startServer((req) async {
+          seenUserAgent = req.headers.value(HttpHeaders.userAgentHeader);
+          seenAccept = req.headers.value(HttpHeaders.acceptHeader);
+          req.response.write('hello');
+          await req.response.close();
+        });
 
-      final lane = createTestLane(1);
-      final bytes = await Crawler(baseUri: baseUri).getBytes(
-        lane,
-        baseUri.resolve('/ok'),
-        headers: {'accept': 'application/vnd.pub.v2+json'},
-      );
-      expect(utf8.decode(bytes), 'hello');
-      expect(seenUserAgent, 'pub_platforms_analyzer/1.0');
-      expect(seenAccept, 'application/vnd.pub.v2+json');
-    });
+        final lane = createTestLane(1);
+        final bytes = await Crawler(baseUri: baseUri).getBytes(
+          lane,
+          baseUri.resolve('/ok'),
+          headers: {'accept': 'application/vnd.pub.v2+json'},
+        );
+        expect(utf8.decode(bytes), 'hello');
+        expect(seenUserAgent, 'pub_platforms_analyzer/1.0');
+        expect(seenAccept, 'application/vnd.pub.v2+json');
+      },
+    );
 
     test('does not retry non-transient 4xx status codes', () async {
       var hits = 0;
@@ -314,8 +345,13 @@ void main() {
       await expectLater(
         Crawler(backoffDelay: _fastBackoff)
             .getBytes(lane, baseUri.resolve('/missing')),
-        throwsA(isA<HttpStatusException>()
-            .having((e) => e.statusCode, 'statusCode', 404)),
+        throwsA(
+          isA<HttpStatusException>().having(
+            (e) => e.statusCode,
+            'statusCode',
+            404,
+          ),
+        ),
       );
       expect(hits, 1);
     });
@@ -338,26 +374,33 @@ void main() {
       expect(hits, 4);
     });
 
-    test('throws HttpStatusException after exhausting 5 transient attempts',
-        () async {
-      var hits = 0;
-      final baseUri = await startServer((req) async {
-        hits++;
-        req.response
-          ..statusCode = 503
-          ..write('down');
-        await req.response.close();
-      });
+    test(
+      'throws HttpStatusException after exhausting 5 transient attempts',
+      () async {
+        var hits = 0;
+        final baseUri = await startServer((req) async {
+          hits++;
+          req.response
+            ..statusCode = 503
+            ..write('down');
+          await req.response.close();
+        });
 
-      final lane = createTestLane(1);
-      await expectLater(
-        Crawler(backoffDelay: _fastBackoff)
-            .getBytes(lane, baseUri.resolve('/down')),
-        throwsA(isA<HttpStatusException>()
-            .having((e) => e.statusCode, 'statusCode', 503)),
-      );
-      expect(hits, 5);
-    });
+        final lane = createTestLane(1);
+        await expectLater(
+          Crawler(backoffDelay: _fastBackoff)
+              .getBytes(lane, baseUri.resolve('/down')),
+          throwsA(
+            isA<HttpStatusException>().having(
+              (e) => e.statusCode,
+              'statusCode',
+              503,
+            ),
+          ),
+        );
+        expect(hits, 5);
+      },
+    );
 
     test('retries dropped socket connection and succeeds', () async {
       var hits = 0;
@@ -379,29 +422,31 @@ void main() {
       expect(hits, 2);
     });
 
-    test('send idle timeout aborts request and frees the sole connection',
-        () async {
-      final baseUri = await startServer((req) async {
-        if (req.uri.path == '/stall') {
-          await Completer<void>().future;
-        }
-        req.response.write('fast');
-        await req.response.close();
-      });
+    test(
+      'send idle timeout aborts request and frees the sole connection',
+      () async {
+        final baseUri = await startServer((req) async {
+          if (req.uri.path == '/stall') {
+            await Completer<void>().future;
+          }
+          req.response.write('fast');
+          await req.response.close();
+        });
 
-      final lane = createTestLane(1);
-      await expectLater(
-        Crawler(
-          idleTimeout: const Duration(milliseconds: 100),
-          backoffDelay: (_) => Duration.zero,
-        ).getBytes(lane, baseUri.resolve('/stall')),
-        throwsA(isA<TimeoutException>()),
-      );
+        final lane = createTestLane(1);
+        await expectLater(
+          Crawler(
+            idleTimeout: const Duration(milliseconds: 100),
+            backoffDelay: (_) => Duration.zero,
+          ).getBytes(lane, baseUri.resolve('/stall')),
+          throwsA(isA<TimeoutException>()),
+        );
 
-      final bytes = await Crawler(idleTimeout: const Duration(seconds: 5))
-          .getBytes(lane, baseUri.resolve('/fast'));
-      expect(utf8.decode(bytes), 'fast');
-    });
+        final bytes = await Crawler(idleTimeout: const Duration(seconds: 5))
+            .getBytes(lane, baseUri.resolve('/fast'));
+        expect(utf8.decode(bytes), 'fast');
+      },
+    );
 
     test('body stream idle timeout aborts and frees connection', () async {
       final baseUri = await startServer((req) async {
@@ -431,98 +476,107 @@ void main() {
       expect(utf8.decode(bytes), 'after-body-stall');
     });
 
-    test('slow steady stream exceeding idleTimeout in total succeeds',
-        () async {
-      var hits = 0;
-      final baseUri = await startServer((req) async {
-        hits++;
-        req.response
-          ..statusCode = 200
-          ..bufferOutput = false;
-        for (var i = 0; i < 8; i++) {
-          req.response.write('chunk$i-');
-          await req.response.flush();
-          await Future<void>.delayed(const Duration(milliseconds: 50));
-        }
-        await req.response.close();
-      }, autoCompress: false);
+    test(
+      'slow steady stream exceeding idleTimeout in total succeeds',
+      () async {
+        var hits = 0;
+        final baseUri = await startServer((req) async {
+          hits++;
+          req.response
+            ..statusCode = 200
+            ..bufferOutput = false;
+          for (var i = 0; i < 8; i++) {
+            req.response.write('chunk$i-');
+            await req.response.flush();
+            await Future<void>.delayed(const Duration(milliseconds: 50));
+          }
+          await req.response.close();
+        }, autoCompress: false);
 
-      // Total stream duration (~400 ms) > idleTimeout (250 ms), while the gap
-      // between chunks (~50 ms) stays well below idleTimeout.
-      final lane = createTestLane(1);
-      final bytes = await Crawler(
-        idleTimeout: const Duration(milliseconds: 250),
-        backoffDelay: _fastBackoff,
-      ).getBytes(lane, baseUri.resolve('/slow-steady'));
-      expect(hits, 1);
-      expect(
-        utf8.decode(bytes),
-        'chunk0-chunk1-chunk2-chunk3-chunk4-chunk5-chunk6-chunk7-',
-      );
-    });
+        // Total stream duration (~400 ms) > idleTimeout (250 ms), while the gap
+        // between chunks (~50 ms) stays well below idleTimeout.
+        final lane = createTestLane(1);
+        final bytes = await Crawler(
+          idleTimeout: const Duration(milliseconds: 250),
+          backoffDelay: _fastBackoff,
+        ).getBytes(lane, baseUri.resolve('/slow-steady'));
+        expect(hits, 1);
+        expect(
+          utf8.decode(bytes),
+          'chunk0-chunk1-chunk2-chunk3-chunk4-chunk5-chunk6-chunk7-',
+        );
+      },
+    );
 
-    test('non-200 stalled body drain times out without leaking connection',
-        () async {
-      var hits = 0;
-      final baseUri = await startServer((req) async {
-        hits++;
-        if (hits == 1) {
+    test(
+      'non-200 stalled body drain times out without leaking connection',
+      () async {
+        var hits = 0;
+        final baseUri = await startServer((req) async {
+          hits++;
+          if (hits == 1) {
+            req.response
+              ..statusCode = 503
+              ..bufferOutput = false
+              ..write('err');
+            await req.response.flush();
+            await Completer<void>().future;
+          }
+          req.response.write('ok');
+          await req.response.close();
+        }, autoCompress: false);
+
+        final lane = createTestLane(1);
+        final bytes = await Crawler(
+          idleTimeout: const Duration(milliseconds: 150),
+          backoffDelay: (_) => Duration.zero,
+        ).getBytes(lane, baseUri.resolve('/drain-stall'));
+        expect(utf8.decode(bytes), 'ok');
+        expect(hits, 2);
+      },
+    );
+
+    test(
+      'stopRequested skips queued work and interrupts retry backoff',
+      () async {
+        var hits = 0;
+        final baseUri = await startServer((req) async {
+          hits++;
           req.response
             ..statusCode = 503
-            ..bufferOutput = false
-            ..write('err');
-          await req.response.flush();
-          await Completer<void>().future;
-        }
-        req.response.write('ok');
-        await req.response.close();
-      }, autoCompress: false);
+            ..write('busy');
+          await req.response.close();
+        });
 
-      final lane = createTestLane(1);
-      final bytes = await Crawler(
-        idleTimeout: const Duration(milliseconds: 150),
-        backoffDelay: (_) => Duration.zero,
-      ).getBytes(lane, baseUri.resolve('/drain-stall'));
-      expect(utf8.decode(bytes), 'ok');
-      expect(hits, 2);
-    });
+        final lane = createTestLane(1);
+        // Already stopped: never hits server.
+        await expectLater(
+          Crawler(stopRequested: Completer<void>()..complete())
+              .getBytes(lane, baseUri.resolve('/a')),
+          throwsA(isA<StoppedException>()),
+        );
+        expect(hits, 0);
 
-    test('stopRequested skips queued work and interrupts retry backoff',
-        () async {
-      var hits = 0;
-      final baseUri = await startServer((req) async {
-        hits++;
-        req.response
-          ..statusCode = 503
-          ..write('busy');
-        await req.response.close();
-      });
-
-      final lane = createTestLane(1);
-      // Already stopped: never hits server.
-      await expectLater(
-        Crawler(stopRequested: Completer<void>()..complete())
-            .getBytes(lane, baseUri.resolve('/a')),
-        throwsA(isA<StoppedException>()),
-      );
-      expect(hits, 0);
-
-      // Stop triggered after entering a 30 s backoff wakes promptly.
-      final stopDuringBackoff = Completer<void>();
-      final sw = Stopwatch()..start();
-      await expectLater(
-        Crawler(
-          stopRequested: stopDuringBackoff,
-          backoffDelay: (_) {
-            Timer(const Duration(milliseconds: 20), stopDuringBackoff.complete);
-            return const Duration(seconds: 30);
-          },
-        ).getBytes(lane, baseUri.resolve('/b')),
-        throwsA(isA<StoppedException>()),
-      );
-      expect(hits, 1);
-      expect(sw.elapsed, lessThan(const Duration(seconds: 2)));
-    });
+        // Stop triggered after entering a 30 s backoff wakes promptly.
+        final stopDuringBackoff = Completer<void>();
+        final sw = Stopwatch()..start();
+        await expectLater(
+          Crawler(
+            stopRequested: stopDuringBackoff,
+            backoffDelay: (_) {
+              Timer(
+                const Duration(milliseconds: 20),
+                stopDuringBackoff.complete,
+              );
+              return const Duration(seconds: 30);
+            },
+          ).getBytes(lane, baseUri.resolve('/b')),
+          throwsA(isA<StoppedException>()),
+        );
+        expect(hits, 1);
+        expect(sw.elapsed, lessThan(const Duration(seconds: 2)));
+      },
+    );
   });
 
   group('fetchScore & processPackage', () {
@@ -543,32 +597,40 @@ void main() {
         requestedPaths.add(req.uri.path);
         switch (req.uri.path) {
           case '/api/packages/plain_pkg':
-            req.response.write(packageMetaJson(
-              'plain_pkg',
-              archiveUrl:
-                  baseUri.resolve('/archives/plain_pkg.tar.gz').toString(),
-              archiveSha: sampleArchiveSha,
-              versions: ['0.9.0', '1.0.0'],
-              extraPubspec: {'flutter': 'not-a-map'},
-            ));
+            req.response.write(
+              packageMetaJson(
+                'plain_pkg',
+                archiveUrl: baseUri
+                    .resolve('/archives/plain_pkg.tar.gz')
+                    .toString(),
+                archiveSha: sampleArchiveSha,
+                versions: ['0.9.0', '1.0.0'],
+                extraPubspec: {'flutter': 'not-a-map'},
+              ),
+            );
           case '/api/packages/plain_pkg/score':
-            req.response.write(jsonEncode({
-              'grantedPoints': 150,
-              'maxPoints': 160,
-              'likeCount': 42,
-              'downloadCount30Days': 12345,
-              'tags': ['sdk:dart', 'license:mit'],
-            }));
+            req.response.write(
+              jsonEncode({
+                'grantedPoints': 150,
+                'maxPoints': 160,
+                'likeCount': 42,
+                'downloadCount30Days': 12345,
+                'tags': ['sdk:dart', 'license:mit'],
+              }),
+            );
           case '/api/packages/my_plugin':
-            req.response.write(packageMetaJson(
-              'my_plugin',
-              version: '1.2.3',
-              isPlugin: true,
-              isDiscontinued: true,
-              archiveUrl:
-                  baseUri.resolve('/archives/my_plugin.tar.gz').toString(),
-              archiveSha: sampleArchiveSha,
-            ));
+            req.response.write(
+              packageMetaJson(
+                'my_plugin',
+                version: '1.2.3',
+                isPlugin: true,
+                isDiscontinued: true,
+                archiveUrl: baseUri
+                    .resolve('/archives/my_plugin.tar.gz')
+                    .toString(),
+                archiveSha: sampleArchiveSha,
+              ),
+            );
           case '/api/packages/my_plugin/score':
             req.response.statusCode = 404;
           case '/api/packages/forbidden/score':
@@ -582,47 +644,56 @@ void main() {
       });
     });
 
-    test('fetchScore converts keys to snake_case, returns null on 404',
-        () async {
-      final crawler = Crawler(baseUri: baseUri);
-      final metaLane = createTestLane(4);
+    test(
+      'fetchScore converts keys to snake_case, returns null on 404',
+      () async {
+        final crawler = Crawler(baseUri: baseUri);
+        final metaLane = createTestLane(4);
 
-      expect(await crawler.fetchScore(metaLane, 'plain_pkg'), {
-        'granted_points': 150,
-        'max_points': 160,
-        'like_count': 42,
-        'download_count_30_days': 12345,
-        'tags': ['sdk:dart', 'license:mit'],
-      });
-      expect(await crawler.fetchScore(metaLane, 'my_plugin'), isNull);
-      await expectLater(
-        crawler.fetchScore(metaLane, 'forbidden'),
-        throwsA(isA<HttpStatusException>()
-            .having((e) => e.statusCode, 'statusCode', 403)),
-      );
-    });
+        expect(await crawler.fetchScore(metaLane, 'plain_pkg'), {
+          'granted_points': 150,
+          'max_points': 160,
+          'like_count': 42,
+          'download_count_30_days': 12345,
+          'tags': ['sdk:dart', 'license:mit'],
+        });
+        expect(await crawler.fetchScore(metaLane, 'my_plugin'), isNull);
+        await expectLater(
+          crawler.fetchScore(metaLane, 'forbidden'),
+          throwsA(
+            isA<HttpStatusException>().having(
+              (e) => e.statusCode,
+              'statusCode',
+              403,
+            ),
+          ),
+        );
+      },
+    );
 
-    test('regular package without --all skips archive and keeps id first',
-        () async {
-      final record = await Crawler(baseUri: baseUri).processPackage(
-        'plain_pkg',
-        false,
-        createTestLane(4),
-        createTestLane(2),
-      );
+    test(
+      'regular package without --all skips archive and keeps id first',
+      () async {
+        final record = await Crawler(baseUri: baseUri).processPackage(
+          'plain_pkg',
+          false,
+          createTestLane(4),
+          createTestLane(2),
+        );
 
-      expect(record.keys.first, 'id');
-      expect(jsonEncode(record), startsWith('{"id":"plain_pkg",'));
-      expect(record['version'], '1.0.0');
-      expect(record['is_plugin'], isFalse);
-      expect(record['is_discontinued'], isFalse);
-      expect(record['version_count'], 2);
-      expect((record['score'] as Map)['download_count_30_days'], 12345);
-      expect(record['entries'], isNull);
-      expect(record['pubspec_yaml'], isNull);
-      expect(record.containsKey('archive_bytes'), isFalse);
-      expect(requestedPaths, isNot(contains('/archives/plain_pkg.tar.gz')));
-    });
+        expect(record.keys.first, 'id');
+        expect(jsonEncode(record), startsWith('{"id":"plain_pkg",'));
+        expect(record['version'], '1.0.0');
+        expect(record['is_plugin'], isFalse);
+        expect(record['is_discontinued'], isFalse);
+        expect(record['version_count'], 2);
+        expect((record['score'] as Map)['download_count_30_days'], 12345);
+        expect(record['entries'], isNull);
+        expect(record['pubspec_yaml'], isNull);
+        expect(record.containsKey('archive_bytes'), isFalse);
+        expect(requestedPaths, isNot(contains('/archives/plain_pkg.tar.gz')));
+      },
+    );
 
     test('plugin package and --all download and list archives', () async {
       final crawler = Crawler(baseUri: baseUri);
@@ -667,134 +738,152 @@ void main() {
       final outFile = File('${dir.path}/pub.jsonl');
       final failFile = File('${dir.path}/failures.jsonl');
       await expectLater(
-        Crawler(baseUri: baseUri, backoffDelay: _fastBackoff, log: (_) {})
-            .run(outFile: outFile, failuresFile: failFile),
+        Crawler(
+          baseUri: baseUri,
+          backoffDelay: _fastBackoff,
+          log: (_) {},
+        ).run(outFile: outFile, failuresFile: failFile),
         throwsA(isA<HttpStatusException>()),
       );
       expect(await outFile.exists(), isFalse);
       expect(await failFile.exists(), isFalse);
     });
 
-    test('crawls, records failures, and resumes cleanly after a partial line',
-        () async {
-      final dir = await createTempDir();
-      final archiveBytes =
-          await buildTarGz([tarFile('pubspec.yaml', 'name: p\n')]);
-      final archiveSha = sha256.convert(archiveBytes).toString();
-      var packageList = ['pkg_ok', 'pkg_plugin', 'pkg_broken'];
-      final metaHits = <String, int>{};
+    test(
+      'crawls, records failures, and resumes cleanly after a partial line',
+      () async {
+        final dir = await createTempDir();
+        final archiveBytes = await buildTarGz([
+          tarFile('pubspec.yaml', 'name: p\n'),
+        ]);
+        final archiveSha = sha256.convert(archiveBytes).toString();
+        var packageList = ['pkg_ok', 'pkg_plugin', 'pkg_broken'];
+        final metaHits = <String, int>{};
 
-      late Uri baseUri;
-      baseUri = await startServer((req) async {
-        final path = req.uri.path;
-        if (path == '/api/package-names') {
-          req.response.write(jsonEncode({'packages': packageList}));
-        } else if (path == '/api/packages/pkg_broken') {
-          metaHits['pkg_broken'] = (metaHits['pkg_broken'] ?? 0) + 1;
-          req.response.statusCode = 404;
-        } else if (path.startsWith('/api/packages/') &&
-            path.endsWith('/score')) {
-          req.response
-              .write(jsonEncode({'grantedPoints': 100, 'likeCount': 5}));
-        } else if (path.startsWith('/api/packages/')) {
-          final name = path.substring('/api/packages/'.length);
-          metaHits[name] = (metaHits[name] ?? 0) + 1;
-          req.response.write(packageMetaJson(
-            name,
-            isPlugin: name == 'pkg_plugin',
-            archiveUrl: baseUri.resolve('/archives/$name.tar.gz').toString(),
-            archiveSha: archiveSha,
-          ));
-        } else if (path.startsWith('/archives/')) {
-          req.response.add(archiveBytes);
-        } else {
-          req.response.statusCode = 404;
+        late Uri baseUri;
+        baseUri = await startServer((req) async {
+          final path = req.uri.path;
+          if (path == '/api/package-names') {
+            req.response.write(jsonEncode({'packages': packageList}));
+          } else if (path == '/api/packages/pkg_broken') {
+            metaHits['pkg_broken'] = (metaHits['pkg_broken'] ?? 0) + 1;
+            req.response.statusCode = 404;
+          } else if (path.startsWith('/api/packages/') &&
+              path.endsWith('/score')) {
+            req.response.write(
+              jsonEncode({'grantedPoints': 100, 'likeCount': 5}),
+            );
+          } else if (path.startsWith('/api/packages/')) {
+            final name = path.substring('/api/packages/'.length);
+            metaHits[name] = (metaHits[name] ?? 0) + 1;
+            req.response.write(
+              packageMetaJson(
+                name,
+                isPlugin: name == 'pkg_plugin',
+                archiveUrl: baseUri
+                    .resolve('/archives/$name.tar.gz')
+                    .toString(),
+                archiveSha: archiveSha,
+              ),
+            );
+          } else if (path.startsWith('/archives/')) {
+            req.response.add(archiveBytes);
+          } else {
+            req.response.statusCode = 404;
+          }
+          await req.response.close();
+        });
+
+        final outFile = File('${dir.path}/pub.jsonl');
+        final failFile = File('${dir.path}/failures.jsonl');
+        final crawler = Crawler(
+          baseUri: baseUri,
+          backoffDelay: _fastBackoff,
+          log: (_) {},
+        );
+
+        final first = await crawler.run(
+          outFile: outFile,
+          failuresFile: failFile,
+          concurrency: 2,
+          archiveConcurrency: 1,
+        );
+        expect(first, (written: 2, failed: 1, total: 3, skipped: 0));
+
+        final originalText = await outFile.readAsString();
+        final lines = const LineSplitter().convert(originalText);
+        expect(lines, hasLength(2));
+        for (final line in lines) {
+          expect(line, startsWith('{"id":"'));
         }
-        await req.response.close();
-      });
+        final byId = {
+          for (final l in lines)
+            (jsonDecode(l) as Map<String, dynamic>)['id'] as String:
+                jsonDecode(l) as Map<String, dynamic>,
+        };
+        expect(byId['pkg_ok']!['entries'], isNull);
+        expect(byId['pkg_plugin']!['entries'], hasLength(1));
 
-      final outFile = File('${dir.path}/pub.jsonl');
-      final failFile = File('${dir.path}/failures.jsonl');
-      final crawler = Crawler(
-        baseUri: baseUri,
-        backoffDelay: _fastBackoff,
-        log: (_) {},
-      );
+        final failureLines = const LineSplitter().convert(
+          await failFile.readAsString(),
+        );
+        expect(failureLines, hasLength(1));
+        expect((jsonDecode(failureLines.single) as Map)['id'], 'pkg_broken');
 
-      final first = await crawler.run(
-        outFile: outFile,
-        failuresFile: failFile,
-        concurrency: 2,
-        archiveConcurrency: 1,
-      );
-      expect(first, (written: 2, failed: 1, total: 3, skipped: 0));
+        // Simulate crash leaving a partial line, then add a new package.
+        await outFile.writeAsString('$originalText{"id":"pkg_new","partial');
+        packageList = ['pkg_ok', 'pkg_plugin', 'pkg_new'];
+        metaHits.clear();
 
-      final originalText = await outFile.readAsString();
-      final lines = const LineSplitter().convert(originalText);
-      expect(lines, hasLength(2));
-      for (final line in lines) {
-        expect(line, startsWith('{"id":"'));
-      }
-      final byId = {
-        for (final l in lines)
-          (jsonDecode(l) as Map<String, dynamic>)['id'] as String:
-              jsonDecode(l) as Map<String, dynamic>,
-      };
-      expect(byId['pkg_ok']!['entries'], isNull);
-      expect(byId['pkg_plugin']!['entries'], hasLength(1));
+        final second = await crawler.run(
+          outFile: outFile,
+          failuresFile: failFile,
+          concurrency: 2,
+          archiveConcurrency: 1,
+        );
+        expect(second, (written: 1, failed: 0, total: 3, skipped: 2));
+        expect(metaHits, {'pkg_new': 1});
 
-      final failureLines =
-          const LineSplitter().convert(await failFile.readAsString());
-      expect(failureLines, hasLength(1));
-      expect((jsonDecode(failureLines.single) as Map)['id'], 'pkg_broken');
-
-      // Simulate crash leaving a partial line, then add a new package.
-      await outFile.writeAsString('$originalText{"id":"pkg_new","partial');
-      packageList = ['pkg_ok', 'pkg_plugin', 'pkg_new'];
-      metaHits.clear();
-
-      final second = await crawler.run(
-        outFile: outFile,
-        failuresFile: failFile,
-        concurrency: 2,
-        archiveConcurrency: 1,
-      );
-      expect(second, (written: 1, failed: 0, total: 3, skipped: 2));
-      expect(metaHits, {'pkg_new': 1});
-
-      final updatedText = await outFile.readAsString();
-      expect(updatedText, startsWith(originalText));
-      final updatedIds = const LineSplitter()
-          .convert(updatedText)
-          .map((l) => (jsonDecode(l) as Map<String, dynamic>)['id'] as String)
-          .toList();
-      expect(updatedIds.toSet(), {'pkg_ok', 'pkg_plugin', 'pkg_new'});
-      expect(updatedIds.length, 3);
-    });
+        final updatedText = await outFile.readAsString();
+        expect(updatedText, startsWith(originalText));
+        final updatedIds = const LineSplitter()
+            .convert(updatedText)
+            .map((l) => (jsonDecode(l) as Map<String, dynamic>)['id'] as String)
+            .toList();
+        expect(updatedIds.toSet(), {'pkg_ok', 'pkg_plugin', 'pkg_new'});
+        expect(updatedIds.length, 3);
+      },
+    );
   });
 
   group('CLI subprocess & signal handling', () {
     test('runs end-to-end via CLI arguments including --all', () async {
       final dir = await createTempDir();
-      final archiveBytes =
-          await buildTarGz([tarFile('pubspec.yaml', 'name: cli_pkg\n')]);
+      final archiveBytes = await buildTarGz([
+        tarFile('pubspec.yaml', 'name: cli_pkg\n'),
+      ]);
       final archiveSha = sha256.convert(archiveBytes).toString();
 
       late Uri baseUri;
       baseUri = await startServer((req) async {
         switch (req.uri.path) {
           case '/api/package-names':
-            req.response.write(jsonEncode({
-              'packages': ['cli_pkg']
-            }));
+            req.response.write(
+              jsonEncode({
+                'packages': ['cli_pkg'],
+              }),
+            );
           case '/api/packages/cli_pkg':
-            req.response.write(packageMetaJson(
-              'cli_pkg',
-              version: '0.1.0',
-              archiveUrl:
-                  baseUri.resolve('/archives/cli_pkg.tar.gz').toString(),
-              archiveSha: archiveSha,
-            ));
+            req.response.write(
+              packageMetaJson(
+                'cli_pkg',
+                version: '0.1.0',
+                archiveUrl: baseUri
+                    .resolve('/archives/cli_pkg.tar.gz')
+                    .toString(),
+                archiveSha: archiveSha,
+              ),
+            );
           case '/api/packages/cli_pkg/score':
             req.response.write(jsonEncode({'grantedPoints': 120}));
           case '/archives/cli_pkg.tar.gz':
@@ -820,8 +909,9 @@ void main() {
 
       expect(code, 0, reason: stderrText);
       expect(stdoutText, contains('1 written, 0 failed of 1'));
-      final row = jsonDecode(await File('${dir.path}/out.jsonl').readAsString())
-          as Map<String, dynamic>;
+      final row = jsonDecode(
+        await File('${dir.path}/out.jsonl').readAsString(),
+      ) as Map<String, dynamic>;
       expect(row['id'], 'cli_pkg');
       expect(row['archive_bytes'], archiveBytes.length);
       expect(await File('${dir.path}/failures.jsonl').readAsString(), isEmpty);
@@ -840,9 +930,11 @@ void main() {
         final baseUri = await startServer((req) async {
           final path = req.uri.path;
           if (path == '/api/package-names') {
-            req.response.write(jsonEncode({
-              'packages': ['first_pkg', 'second_pkg', 'third_pkg'],
-            }));
+            req.response.write(
+              jsonEncode({
+                'packages': ['first_pkg', 'second_pkg', 'third_pkg'],
+              }),
+            );
           } else if (path == '/api/packages/first_pkg/score') {
             if (!scoreStarted.isCompleted) scoreStarted.complete();
             await releaseScore.future;
@@ -896,7 +988,9 @@ void main() {
         expect(lines, hasLength(1));
         expect((jsonDecode(lines.single) as Map)['id'], 'first_pkg');
         expect(
-            await File('${dir.path}/failures.jsonl').readAsString(), isEmpty);
+          await File('${dir.path}/failures.jsonl').readAsString(),
+          isEmpty,
+        );
       },
       skip: Platform.isWindows ? 'SIGTERM cannot be watched on Windows' : false,
     );
@@ -909,9 +1003,11 @@ void main() {
 
         final baseUri = await startServer((req) async {
           if (req.uri.path == '/api/package-names') {
-            req.response.write(jsonEncode({
-              'packages': ['stuck_pkg']
-            }));
+            req.response.write(
+              jsonEncode({
+                'packages': ['stuck_pkg'],
+              }),
+            );
             await req.response.close();
             return;
           }
